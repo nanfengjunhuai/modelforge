@@ -1,0 +1,25 @@
+# 统一换行符为 LF。
+#
+# 不加这个文件的话，Windows 上的 git 会把文本文件的 LF 转成 CRLF 存进工作区，
+# 于是你在 Windows 改一行、别人在 macOS/Linux 上看就是整个文件都变了。
+# 这是跨平台协作项目最常见的 diff 噪音来源。
+* text=auto eol=lf
+
+# Windows 批处理脚本必须保留 CRLF，否则可能无法执行
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制文件一律不做换行符转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+
+# 锁文件在 diff 里默认折叠，避免刷屏
+package-lock.json  -diff linguist-generated
+poetry.lock        -diff linguist-generated
