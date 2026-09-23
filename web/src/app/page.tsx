@@ -103,7 +103,7 @@ export default function Home() {
         {status === 'loading' && (
           <div className="flex items-center justify-center gap-4">
             <span className="h-6 w-6 shrink-0 animate-spin rounded-full border-[3px] border-grid border-t-brand-500" />
-            <p className="text-lead font-medium text-ink">您的宝agent正在赶来……</p>
+            <p className="text-lead font-medium text-ink">蒟蒻agent正在赶来……</p>
           </div>
         )}
 
@@ -115,7 +115,7 @@ export default function Home() {
           <div>
             <p className="flex items-center gap-3 text-lead font-semibold text-good-ink">
               <span className="h-3 w-3 shrink-0 rounded-full bg-good" />
-              一切就绪 · 您的宝agent已就位
+              一切就绪 · 蒟蒻agent已就位
             </p>
 
             {/* 状态色永远配「圆点 + 文字」，不靠颜色单独传达信息——
