@@ -9,6 +9,7 @@
 //  不用翻遍所有组件。M2 之后新建的每个组件都照此办理。
 // ════════════════════════════════════════════════════════════════════════
 
+import Link from 'next/link'
 import { useEffect, useState } from 'react'
 
 // ─────────────────────────────────────────────────────────── 类型
@@ -19,8 +20,21 @@ import { useEffect, useState } from 'react'
  * 用一个联合类型而不是三个布尔值（isLoading / isError / hasData）：
  * 三个布尔值能组合出 8 种情况，其中 4 种逻辑上荒谬（比如「又加载又有数据又报错」）。
  * 用联合类型，非法状态从源头就不存在——与 Pydantic 的 Literal 是同一个思路。
+ *
+ * ⚠️ 这里原本还有第四个状态 `idle`（组件已挂载，但请求还没发出去）。
+ *    M2 引入 React Compiler 的 lint 时它被删掉了，原因值得记一笔：
+ *
+ *    为了让 idle 过渡到 loading，得在 useEffect 里同步调一次 setStatus('loading')。
+ *    而 React 的 react-hooks/set-state-in-effect 规则会拦下这种写法 ——
+ *    它触发一次额外的级联渲染，换来的视觉差异却是**零**：
+ *    idle 和 loading 对用户是同一件事，都是「还没结果，等着」。
+ *
+ *    两个状态描述同一件事，本身就是建模冗余。正确做法是**让初始值直接就是
+ *    loading** —— 组件挂载就意味着请求马上要发出去了，这本来就是事实。
+ *
+ *    这是「设计会在实现中收敛」的一个小例子，不是返工。
  */
-type Status = 'idle' | 'loading' | 'success' | 'error'
+type Status = 'loading' | 'success' | 'error'
 
 /** 后端 GET /api/health 的返回结构，字段名与 modelforge/api/health.py 一一对应。 */
 type HealthInfo = {
@@ -46,22 +60,21 @@ const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000'
 export default function Home() {
   // ══════════════ 状态 ══════════════
   //
-  // 初始值必须是 'idle' 而不是 'loading'：
-  // 组件刚渲染的那一瞬间 useEffect 还没执行，请求根本没发出去。
-  // 如果这里写 'success'，后端挂掉时页面会先闪一下「成功」再跳到「失败」。
-  const [status, setStatus] = useState<Status>('idle')
+  // 初始值就是 'loading'：组件挂载的下一秒 useEffect 就会发请求，
+  // 说「正在加载」是此刻唯一诚实的描述。
+  // （绝不能写 'success' —— 后端挂掉时页面会先闪一下「成功」再跳到「失败」。）
+  const [status, setStatus] = useState<Status>('loading')
   const [info, setInfo] = useState<HealthInfo | null>(null)
 
   // ══════════════ 副作用 ══════════════
   //
-  // 三个 setStatus 画出了这个组件的完整生命线：
-  //     idle ──loading──> loading ──┬─成功─> success
-  //                                 └─失败─> error
-  // 状态是手动推进的——React 不会读心，你不说「我在等」，
-  // 它就一直以为是 idle，那几百毫秒里页面什么都不显示。
+  // 两条 setStatus 画出了这个组件的剩余生命线：
+  //     loading ──┬─成功─> success
+  //               └─失败─> error
+  //
+  // 注意这里**没有**在 effect 开头同步 setStatus('loading')：
+  // 那会白白多触发一次渲染，而初始值已经表达过这个意思了。
   useEffect(() => {
-    setStatus('loading')
-
     fetch(`${API_BASE}/api/health`)
       .then((res) => res.json())
       .then((data: HealthInfo) => {
@@ -92,12 +105,7 @@ export default function Home() {
 
       {/* ──────── 状态卡片 ──────── */}
       <section className="w-full max-w-lg rounded-card border border-hairline bg-surface p-10 shadow-sm">
-        {/* ① idle —— 组件刚挂载，useEffect 还没跑，存在时间以毫秒计 */}
-        {status === 'idle' && (
-          <p className="text-center text-body text-ink-muted">准备中……</p>
-        )}
-
-        {/* ② loading —— 请求在路上。
+        {/* ① loading —— 请求在路上。
             这个转圈是纯 CSS 画的（animate-spin 让边框不完整的圆环匀速旋转），
             零图片、零第三方组件。 */}
         {status === 'loading' && (
@@ -162,13 +170,20 @@ export default function Home() {
 
       {/* ──────── 页脚 ──────── */}
       <footer className="text-body text-ink-muted">
+        <Link
+          href="/chat"
+          className="underline decoration-hairline underline-offset-4 transition-colors hover:text-ink-secondary"
+        >
+          进入对话（M2 流式输出）
+        </Link>
+        <span className="mx-3">·</span>
         <a
           href={`${API_BASE}/api/docs`}
           target="_blank"
           rel="noopener noreferrer"
           className="underline decoration-hairline underline-offset-4 transition-colors hover:text-ink-secondary"
         >
-          查看 API 文档
+          API 文档
         </a>
         <span className="mx-3">·</span>
         <span>M0 · 骨架验证</span>
