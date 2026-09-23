@@ -39,10 +39,27 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
-__all__ = ["ARTIFACTS_DIR", "COLORS", "GRAYSCALE_STYLES", "save", "style", "style_lines"]
+__all__ = [
+    "ARTIFACTS_DIR",
+    "CHART_KINDS",
+    "COLORS",
+    "GRAYSCALE_STYLES",
+    "save",
+    "style",
+    "style_lines",
+]
+
+#: `chart["kind"]` 认得的取值 —— 也就是工作台**渲染得出来**的那几种。
+#:
+#: ⚠️ 这份清单是**前后端共享的事实**，不是这里随便定的：前端的
+#: `web/src/lib/chart-spec.ts` 里有一份 `KNOWN_CHART_KINDS` 跟着它，
+#: `tests/test_chart_contract.py` 盯着两边一致。加第五种图型时，
+#: 前端不加就渲染不出来，那个测试会红。
+CHART_KINDS = ("bar", "line", "scatter", "pie")
 
 #: 产物目录名。**必须**是这个名字 —— 沙箱执行器扫的就是它（见
 #: `modelforge/sandbox/subprocess_exec.py` 的 `_ARTIFACT_DIRNAME`）。
@@ -194,6 +211,11 @@ def save(
             ⚠️ `data` 里必须是**你算出来的真实数组**，不能凭印象重打一遍。
             这个参数存在的全部意义就是「图和数字同源」，手打就失去意义了。
             颜色不用写，会按顺序自动取调色板。
+
+            ⚠️ **不能有 NaN / Infinity**（`np.nan`、`np.inf`、`0/0` 的结果）。
+            这两个值不是合法的 JSON，存下来的文件浏览器读不了。
+            传进来会在下面报一条说明，图照存，只是可交互版本没有数据。
+            缺失点请自己先处理掉（`np.nan_to_num`、或者用 `np.isfinite` 过滤）。
         caption: 可选的一句话说明，存进 chart.json，给报告用。
         formats: 要输出的格式，默认 PNG + PDF 都要。
 
@@ -238,6 +260,20 @@ def save(
         # 那句报错里已经写清了哪一项不对、应该是什么形状。
         try:
             spec = _build_chart_spec(chart, title=stem, caption=caption, fig=fig)
+            payload = out_dir / f"{stem}.chart.json"
+            # `allow_nan=False` 是**第二道防线**，不是多余的谨慎：
+            # Python 的 json 默认允许 NaN / Infinity 并**原样写出去**，
+            # 而那两个字面量**不是合法 JSON** —— 浏览器那边 JSON.parse
+            # 直接抛 SyntaxError。真发生了会得到一个磁盘上明明存在、
+            # 却谁也读不了的 .chart.json，而前端的表现是
+            # 「读不到这份数据（文件可能已经不在了）」—— 一句假话。
+            #
+            # 第一道防线在 _number()：它会指名道姓地说出是哪个值不对。
+            # 这一道防的是「将来有人绕过 _number() 塞进非有限值」。
+            payload.write_text(
+                json.dumps(spec, ensure_ascii=False, indent=2, allow_nan=False),
+                encoding="utf-8",
+            )
         except (TypeError, ValueError) as exc:
             print(
                 f"【chart 数据没能保存】图片已经存好了，但 chart 参数有问题：{exc}\n"
@@ -245,10 +281,6 @@ def save(
                 "如果你需要可交互版本，按上面这句提示改一下 chart 再存一次。）"
             )
         else:
-            payload = out_dir / f"{stem}.chart.json"
-            payload.write_text(
-                json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
             written.append(f"{payload.name}（{len(spec['series'])} 个系列）")
 
     # 打印出来是给**模型**看的 —— 它会从这里知道文件叫什么名字，
@@ -291,7 +323,21 @@ def _build_chart_spec(
     if not isinstance(kind, str) or not kind:
         raise ValueError(
             'chart 里缺少 "kind" 字段。它说明这是什么图，'
-            '取值可以是 "bar" / "line" / "scatter" / "pie"。'
+            f"取值可以是 {' / '.join(repr(k) for k in CHART_KINDS)}。"
+        )
+
+    # 不认得的 kind **只警告，不抛异常** —— 理由和上面 chart 参数写歪时一样
+    # （图是主产物），而且这里还有第二层：图已经**画出来了**，
+    # 只是工作台不知道怎么把它渲染成可交互版本。
+    #
+    # 前端那边对未知 kind 的处理是「渲染表格 + 一句说明」，不会白屏 ——
+    # 但两边各说各话的话，模型会以为存成功了，用户却只看到一张表。
+    # 所以这里必须说出来。
+    if kind not in CHART_KINDS:
+        print(
+            f"【chart 的 kind 工作台不认得】收到的是 {kind!r}，"
+            f"目前只支持 {' / '.join(CHART_KINDS)}。"
+            "数据已经存下来了，工作台会把它当表格展示，但画不出交互图。"
         )
 
     raw_series = chart.get("series")
@@ -373,14 +419,39 @@ def _as_sequence(value: Any) -> list[Any] | None:
 
 
 def _number(value: Any, series_index: int) -> float:
-    """把任意数值转成 float，转不了就给出人话报错。"""
+    """把任意数值转成 float，转不了就给出人话报错。
+
+    ⚠️ **非有限值（NaN / ±Infinity）也要拒绝**，不是因为它们画不出图
+    （matplotlib 画得出来，只是那一段断开），而是因为它们**存不进 JSON**：
+
+        json.dumps({"data": [float("nan")]})  →  {"data": [NaN]}
+        JSON.parse('{"data": [NaN]}')         →  SyntaxError
+
+    Python 的 json 默认 `allow_nan=True`，会把这两个**不是合法 JSON 的**
+    字面量原样写进文件。后果是那个 `.chart.json` 在磁盘上明明存在、
+    Python 这边也读得回来，**只有浏览器读不了** —— 而前端的报错是
+    「读不到这份数据（文件可能已经不在了）」，把人和文件系统引向
+    完全错误的方向。
+
+    触发条件一点都不罕见：归一化里的 `0/0`、`np.log(0)`、
+    数据里本来就有的 `np.nan`（Excel 里的空单元格读进来就是它）。
+    """
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(
             f"series 第 {series_index} 项的 data 里有非数值：{value!r}（{type(value).__name__}）。"
             "如果这是类别标签，它应该放进 chart 的 categories 字段。"
         ) from exc
+
+    if not math.isfinite(number):
+        raise ValueError(
+            f"series 第 {series_index} 项的 data 里有非有限值：{number}。"
+            "常见来源是归一化时的 0/0、np.log(0)、或者数据里的 np.nan。"
+            "先把它处理掉再传进来（比如过滤掉缺失点、或者用 np.nan_to_num），"
+            "否则这份数据存不成合法的 JSON，工作台里的可交互版本读不出来。"
+        )
+    return number
 
 
 def _axis_labels(fig: Any) -> tuple[str, str]:

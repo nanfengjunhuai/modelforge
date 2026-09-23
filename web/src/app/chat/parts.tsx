@@ -16,6 +16,7 @@
 
 import { useState } from 'react'
 
+import { formatBytes, isChartData, KIND_LABEL } from '@/lib/artifact-format'
 import {
   extractAskUser,
   extractCode,
@@ -23,8 +24,8 @@ import {
   type Msg,
   type ToolCallView,
 } from '@/lib/chat-state'
-import type { ArtifactRef } from '@/lib/stream-types'
 import { artifactUrl } from '@/lib/sessions'
+import type { ArtifactRef } from '@/lib/stream-types'
 
 // ══════════════════════════════════════════════════════ 消息气泡
 
@@ -40,6 +41,7 @@ export function MessageBubble({
   streaming,
   submittingCallId,
   onDecide,
+  onOpenArtifact,
   sessionId,
 }: {
   msg: Msg
@@ -47,6 +49,8 @@ export function MessageBubble({
   /** 正在提交中的决策 call_id —— 用来禁用按钮，防止连点。 */
   submittingCallId: string | null
   onDecide: (callId: string, choice: string, note: string) => void
+  /** 在右侧工作台里打开某个产物（M5b）。面板由 `page.tsx` 持有。 */
+  onOpenArtifact: (artifactId: string) => void
   /** 产物要从 `/api/artifacts/{会话}/{产物}` 取，所以得透到工具卡片那一层。 */
   sessionId: string
 }) {
@@ -89,6 +93,7 @@ export function MessageBubble({
               tool={tool}
               submitting={submittingCallId === tool.decision?.callId}
               onDecide={onDecide}
+              onOpenArtifact={onOpenArtifact}
               sessionId={sessionId}
             />
           ))}
@@ -108,17 +113,21 @@ function ToolView({
   tool,
   submitting,
   onDecide,
+  onOpenArtifact,
   sessionId,
 }: {
   tool: ToolCallView
   submitting: boolean
   onDecide: (callId: string, choice: string, note: string) => void
+  onOpenArtifact: (artifactId: string) => void
   sessionId: string
 }) {
   if (tool.decision || tool.name === 'ask_user') {
     return <DecisionCard tool={tool} submitting={submitting} onDecide={onDecide} />
   }
-  return <ToolCallCard tool={tool} sessionId={sessionId} />
+  return (
+    <ToolCallCard tool={tool} sessionId={sessionId} onOpenArtifact={onOpenArtifact} />
+  )
 }
 
 // ══════════════════════════════════════════════════════ 决策卡片
@@ -273,7 +282,15 @@ function DecisionCard({
  * M3 最重要的界面元素 —— 它把「Agent 在后台干了什么」摊开给用户看。
  * 没有它，用户只能看到模型说「我算出来是 5050」，无从判断这个数是怎么来的。
  */
-function ToolCallCard({ tool, sessionId }: { tool: ToolCallView; sessionId: string }) {
+function ToolCallCard({
+  tool,
+  sessionId,
+  onOpenArtifact,
+}: {
+  tool: ToolCallView
+  sessionId: string
+  onOpenArtifact: (artifactId: string) => void
+}) {
   // 折叠状态交给 React 管（受控），而不是让 <details> 自己管（非受控）。
   // 非受控的话会有一个很隐蔽的坑：组件每次重渲染，React 都会把 open 属性
   // 按 vdom 里的值重新写一遍，把用户手动折叠的状态冲掉。
@@ -325,7 +342,11 @@ function ToolCallCard({ tool, sessionId }: { tool: ToolCallView; sessionId: stri
           图是这张卡片上最值得看的东西，藏进「代码与输出」里就等于没有。
           层次是：状态 → 产物 → 细节（代码和 stdout 按需展开）。 */}
       {result && result.artifacts.length > 0 && (
-        <ArtifactGallery sessionId={sessionId} artifacts={result.artifacts} />
+        <ArtifactGallery
+          sessionId={sessionId}
+          artifacts={result.artifacts}
+          onOpenArtifact={onOpenArtifact}
+        />
       )}
 
       {/* ── 主体：代码 + 输出，可折叠 ── */}
@@ -400,9 +421,11 @@ function ToolCallCard({ tool, sessionId }: { tool: ToolCallView; sessionId: stri
 function ArtifactGallery({
   sessionId,
   artifacts,
+  onOpenArtifact,
 }: {
   sessionId: string
   artifacts: ArtifactRef[]
+  onOpenArtifact: (artifactId: string) => void
 }) {
   // 图排在前面：它是这一轮里最值得看的东西，让它出现在需要滚动才能到的地方
   // 是说不过去的。
@@ -425,7 +448,12 @@ function ArtifactGallery({
           }`}
         >
           {files.map((artifact) => (
-            <ArtifactFile key={artifact.id} sessionId={sessionId} artifact={artifact} />
+            <ArtifactFile
+              key={artifact.id}
+              sessionId={sessionId}
+              artifact={artifact}
+              onOpenArtifact={onOpenArtifact}
+            />
           ))}
         </div>
       )}
@@ -479,25 +507,15 @@ function ArtifactImage({
   )
 }
 
-const KIND_LABEL: Record<ArtifactRef['kind'], string> = {
-  data: '数据',
-  document: '文档',
-  other: '文件',
-  image: '图片', // 图片走缩略图那条路，这个标签用不上，但类型要求齐全
-}
-
 function ArtifactFile({
   sessionId,
   artifact,
+  onOpenArtifact,
 }: {
   sessionId: string
   artifact: ArtifactRef
+  onOpenArtifact: (artifactId: string) => void
 }) {
-  // 约定：`<名字>.chart.json` 是 `mp.save(chart=...)` 存下来的**图背后的数据**。
-  // 它下一轮会被用来渲染可交互的版本，这一轮先原样展示 ——
-  // 「图表建立在数据之上」这件事得先看得见，才谈得上后面拿它画图。
-  const isChartData = artifact.name.endsWith('.chart.json')
-
   return (
     <div className="flex flex-col gap-1">
       <div className="flex items-center gap-2 text-caption">
@@ -517,86 +535,28 @@ function ArtifactFile({
           下载
         </a>
       </div>
-      {isChartData && <ChartDataView sessionId={sessionId} artifact={artifact} />}
+      {isChartData(artifact) && (
+        <button
+          type="button"
+          onClick={() => onOpenArtifact(artifact.id)}
+          className="self-start rounded-control border border-hairline bg-raised px-2.5 py-1 text-caption text-ink-secondary transition-colors hover:border-brand-300 hover:text-ink"
+        >
+          在工作台里打开
+        </button>
+      )}
     </div>
   )
 }
 
 /**
- * 把 `.chart.json` 里的数据摊开给用户看。
+ * 之前这里有一个 `ChartDataView` —— 展开时把 `.chart.json` 原样打印出来。
  *
- * ════════════════════════════════════════════════════════════════════
- * 为什么是「打开时才去取」，而不是一进页面就全拉回来
- * ════════════════════════════════════════════════════════════════════
- * 一次对话可能画十几张图，每张都带一份数据。全拉的话，用户只是打开一个
- * 旧会话，浏览器就要发十几个请求、把几百 KB 的 JSON 读进内存 ——
- * 而其中大部分他根本不会看。
+ * M5b 把它换成了上面那个「在工作台里打开」按钮，因为右侧面板现在
+ * **真的能渲染**那份数据了（交互图 + 数据表），原样打印一段 JSON
+ * 就只剩下噪声：几百行花括号，用户既读不出数值、也看不出结构。
  *
- * 这里只在他真的展开时才去取一次，取过就留着（`state !== 'idle'` 那个判断）。
- * 和 `loading="lazy"` 是同一个思路：**默认不付看不见的代价。**
- *
- * 触发点是 `onToggle` 而不是 `useEffect`：这是**用户动作**引起的，
- * 不是「状态变了要同步」。写在 effect 里会被 React Compiler 的
- * `set-state-in-effect` 规则拦下来，而那条规则拦得对 —— effect 里的
- * setState 会多渲染一轮，还容易写出循环。
+ * 那个版本的加载时机还有个值得留下的结论：它是**展开时才去取**，
+ * 而不是一进页面就把所有图的数据全拉回来 —— 一次对话可能画十几张图，
+ * 全拉意味着打开一个旧会话就要发十几个请求。现在这条性质由更强的
+ * 一条取代了：**只有被点开的那一个产物才会去取**。
  */
-function ChartDataView({
-  sessionId,
-  artifact,
-}: {
-  sessionId: string
-  artifact: ArtifactRef
-}) {
-  const [phase, setPhase] = useState<'idle' | 'loading' | 'ready' | 'failed'>('idle')
-  const [spec, setSpec] = useState<unknown>(null)
-
-  async function load() {
-    if (phase !== 'idle') return // 只取一次
-    setPhase('loading')
-    try {
-      const response = await fetch(artifactUrl(sessionId, artifact.id))
-      if (!response.ok) throw new Error(String(response.status))
-      setSpec(await response.json())
-      setPhase('ready')
-    } catch {
-      setPhase('failed')
-    }
-  }
-
-  return (
-    <details
-      onToggle={(event) => {
-        if (event.currentTarget.open) void load()
-      }}
-    >
-      <summary className="cursor-pointer select-none text-caption text-ink-muted transition-colors hover:text-ink-secondary">
-        图背后的数据
-      </summary>
-      {phase === 'loading' && (
-        <p className="pt-1 text-caption text-ink-muted">正在读取……</p>
-      )}
-      {phase === 'failed' && (
-        <p className="pt-1 text-caption text-serious-ink">
-          读不到这份数据（文件可能已经不在了）。
-        </p>
-      )}
-      {phase === 'ready' && (
-        <pre className="mt-1 max-h-64 overflow-auto rounded-control border border-hairline bg-surface px-3 py-2 text-caption leading-relaxed text-ink-secondary">
-          {JSON.stringify(spec, null, 2)}
-        </pre>
-      )}
-    </details>
-  )
-}
-
-/**
- * 字节数 → 人看得懂的写法。
- *
- * 用 KB / MB（1000 进制）而不是 KiB / MiB：这里显示的是给用户估个大小的，
- * 「这个文件大概多大」比「精确到 1024 的二进制单位」重要得多。
- */
-function formatBytes(size: number): string {
-  if (size < 1000) return `${size} B`
-  if (size < 1000 * 1000) return `${Math.round(size / 1000)} KB`
-  return `${(size / (1000 * 1000)).toFixed(1)} MB`
-}

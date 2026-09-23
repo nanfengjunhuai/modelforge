@@ -37,7 +37,12 @@
  */
 
 import type { Decision, LoggedMessage, SessionDetail } from './log-types'
-import type { FinishReason, ToolResultEvent, StreamEvent } from './stream-types'
+import type {
+  ArtifactRef,
+  FinishReason,
+  ToolResultEvent,
+  StreamEvent,
+} from './stream-types'
 
 // ══════════════════════════════════════════════════════ 类型
 
@@ -135,6 +140,27 @@ export function pendingDecision(
 export function allDecisions(state: ChatState): DecisionView[] {
   return state.messages.flatMap((m) =>
     m.tools.flatMap((t) => (t.decision ? [t.decision] : [])),
+  )
+}
+
+/**
+ * 本会话产出过的**所有**产物，按产出顺序（M5b 新增）。
+ *
+ * 右侧那个产物面板的清单就是它 —— 一个**全局视图**，
+ * 和工具卡片里那份「局部上下文」并存，不是同一份信息搬来搬去。
+ *
+ * ⚠️ 值得说明的是它**不需要后端做任何事**。产物引用本来就挂在
+ * `ToolResult.artifacts` 上跟着 `tool` 事件进了日志（ADR-011），
+ * 而 `ChatState` 是那份日志的投影 —— 无论是实时流还是刷新回放，
+ * 产物都已经在手里了。所以这个函数只是把嵌套的数组摊平。
+ *
+ * 也因此它继承了一个**已知的**性质：文件在磁盘上被删掉了，
+ * 这里仍然列得出来（日志只能 append，ADR-009）。点开时才会发现
+ * 取不到 —— 那时面板给的是「文件已经不在了」，不是空白。
+ */
+export function allArtifacts(state: ChatState): ArtifactRef[] {
+  return state.messages.flatMap((m) =>
+    m.tools.flatMap((t) => t.result?.artifacts ?? []),
   )
 }
 
