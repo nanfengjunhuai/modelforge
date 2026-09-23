@@ -57,6 +57,16 @@ class Settings(BaseSettings):
     最坏耗时 ≈ `agent_max_tool_rounds × (sandbox_timeout + 模型延迟)`
     ≈ 5 × (10 + 5) = 75 秒。180 秒是它的两倍多，留了余量。
     **改了 `agent_max_tool_rounds` 或 `sandbox_timeout` 要回头看这个值。**
+
+    ⚠️ **M6a 起多了一个这条公式没覆盖到的持有者：报告生成。**
+    它是**每节一次模型调用**（四节），耗时是「4 × 模型延迟」而不是
+    「轮数 ×（沙箱 + 模型）」，慢起来可以远超 180 秒 —— 而模型延迟那个
+    变量不归我们控制。
+
+    所以别把「TTL 够长」当成保护。真正保证正确性的是**租约的所有权令牌**
+    （M6a 加的，见 `sessions/base.py::acquire_lease`）：超时不会让两条流
+    同时写日志，只会让后到的那个请求在 TTL 窗口内被 409 挡掉或者抢到。
+    这里这个值调大调小，只影响「卡住之后多久自愈」。
     """
 
     artifacts_dir: Path = user_data_dir() / "artifacts"

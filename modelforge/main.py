@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from modelforge import __version__
 from modelforge import artifacts as artifact_store_pkg
-from modelforge.api import artifacts, chat, health, sessions
+from modelforge.api import artifacts, chat, health, reports, sessions
 from modelforge.config import get_settings
 
 # ⚠️ 注意别把这两个搞混：`sessions.get_store()` 给的是**会话**存储
@@ -153,6 +153,10 @@ def create_app() -> FastAPI:
     app.include_router(health.router, prefix="/api")
     app.include_router(chat.router, prefix="/api")
     app.include_router(sessions.router, prefix="/api")
+    # reports 和 sessions 共用 `/sessions` 前缀 —— 生成报告本来就是会话上的
+    # 一个动作。分成两个模块只是因为 sessions.py 已经五百多行了
+    # （和 api/artifacts.py 当初分出去是同一条理由）。
+    app.include_router(reports.router, prefix="/api")
     app.include_router(artifacts.router, prefix="/api")
 
     logger.info(

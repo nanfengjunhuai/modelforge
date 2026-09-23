@@ -348,8 +348,8 @@ async def test_a_session_can_only_be_leased_once(store: SqliteSessionStore):
     """
     session = await store.create()
 
-    assert await store.acquire_lease(session.id, seconds=60) is True
-    assert await store.acquire_lease(session.id, seconds=60) is False
+    assert await store.acquire_lease(session.id, seconds=60) is not None
+    assert await store.acquire_lease(session.id, seconds=60) is None
 
     fetched = await store.get(session.id)
     assert fetched is not None
@@ -358,11 +358,50 @@ async def test_a_session_can_only_be_leased_once(store: SqliteSessionStore):
 
 async def test_releasing_a_lease_frees_it(store: SqliteSessionStore):
     session = await store.create()
-    await store.acquire_lease(session.id, seconds=60)
+    token = await store.acquire_lease(session.id, seconds=60)
+    assert token is not None
 
-    await store.release_lease(session.id)
+    await store.release_lease(session.id, token=token)
 
-    assert await store.acquire_lease(session.id, seconds=60) is True
+    assert await store.acquire_lease(session.id, seconds=60) is not None
+
+
+async def test_an_expired_holder_cannot_release_the_new_holders_lease(
+    store: SqliteSessionStore,
+):
+    """**M6a 修的那个漏洞，这条测试就是它的看门人。**
+
+    故事：一个跑得比 TTL 还慢的请求（报告生成是 4 次模型调用，必然如此）
+    终于跑完了，在 `finally` 里还租约。但它的租约**早就过期**了，会话已经
+    被另一个请求合法地接管 —— 如果释放是无条件的，它放掉的是**别人的**租约。
+    接着第三个请求也能进来，两条流交错写同一个日志，投影出来是非法历史。
+
+    整套东西的关键在于「释放」不是无条件的：
+    迟到者交回的令牌对不上，那条 UPDATE 一行都打不中。
+
+    ⚠️ 别把这条测试简化掉。它和上面那些的区别是：**它需要一个真实的、
+    已经过期的租约**，而所有用假 Provider 的端点测试里，租约都是瞬时的，
+    永远撞不到这个时序。
+    """
+    session = await store.create()
+
+    # 慢的那个：拿到令牌，然后租约当场过期（seconds=-1）。
+    stale = await store.acquire_lease(session.id, seconds=-1)
+    assert stale is not None
+
+    # 快的那个：合法接管。
+    fresh = await store.acquire_lease(session.id, seconds=60)
+    assert fresh is not None
+    assert fresh != stale, "接管之后必须是**另一个**令牌，否则所有权无从谈起"
+
+    # 慢的那个终于跑完了，来还租约。
+    await store.release_lease(session.id, token=stale)
+
+    still_held = await store.acquire_lease(session.id, seconds=60)
+    assert still_held is None, (
+        "过期的持有者把**别人的**租约放掉了 —— 现在第三条流也能进来，"
+        "两条流会交错写同一个日志"
+    )
 
 
 async def test_an_expired_lease_can_be_taken_over(store: SqliteSessionStore):
@@ -378,7 +417,7 @@ async def test_an_expired_lease_can_be_taken_over(store: SqliteSessionStore):
     # seconds=-1 → 租约立刻就是过期的
     await store.acquire_lease(session.id, seconds=-1)
 
-    assert await store.acquire_lease(session.id, seconds=60) is True
+    assert await store.acquire_lease(session.id, seconds=60) is not None
 
 
 async def test_clearing_all_leases_frees_every_session(store: SqliteSessionStore):
@@ -395,7 +434,7 @@ async def test_clearing_all_leases_frees_every_session(store: SqliteSessionStore
     cleared = await store.clear_all_leases()
 
     assert cleared == 2
-    assert await store.acquire_lease(first.id, seconds=60) is True
+    assert await store.acquire_lease(first.id, seconds=60) is not None
 
 
 async def test_leasing_an_unknown_session_fails_instead_of_creating_one(
@@ -406,7 +445,58 @@ async def test_leasing_an_unknown_session_fails_instead_of_creating_one(
     这不是 bug：两种情况对调用方来说都是「你现在不能用它」。
     但如果哪天有人把实现改成「先 INSERT 再 UPDATE」，这条会红。
     """
-    assert await store.acquire_lease("does-not-exist", seconds=60) is False
+    assert await store.acquire_lease("does-not-exist", seconds=60) is None
+
+
+# ══════════════════════════════════════════════════════ 迁移
+
+
+async def test_an_existing_database_gets_the_new_lease_column(tmp_path: Path):
+    """`CREATE TABLE IF NOT EXISTS` **不会**给一张已存在的表加列。
+
+    这条守的是 M6a 加 `lease_token` 那一列时踩到的坑：开发机上永远复现不了
+    （库删掉重建就好，新 schema 直接生效），而用户机器上是一启动就炸 ——
+    报「no such column: lease_token」，那句话完全不提「你忘了迁移」。
+
+    所以这里手工造一个**M6a 之前**的库（sessions 表里没有 lease_token），
+    让 `SqliteSessionStore` 照常打开它，然后确认租约能用。
+
+    ⚠️ 别把这条测试改成「先建 store 再手工删列」，那样两条路都走了新 schema，
+    测了个寂寞。
+    """
+    db = tmp_path / "old.db"
+    legacy = sqlite3.connect(str(db))
+    legacy.executescript(
+        """
+        CREATE TABLE sessions (
+            id          TEXT PRIMARY KEY,
+            title       TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            lease_until REAL,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
+        CREATE TABLE events (
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            seq        INTEGER NOT NULL,
+            kind       TEXT NOT NULL,
+            payload    TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (session_id, seq)
+        );
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    # 打开它 —— 正常的构造路径，迁移发生在 _connect() 里。
+    old_style = SqliteSessionStore(settings=Settings(database_path=db))
+    session = await old_style.create()
+
+    token = await old_style.acquire_lease(session.id, seconds=60)
+    assert token is not None, "老库上租约不工作了 —— 迁移没跑"
+    await old_style.release_lease(session.id, token=token)
+    assert await old_style.acquire_lease(session.id, seconds=60) is not None
 
 
 # ══════════════════════════════════════════════════════ 路径解析

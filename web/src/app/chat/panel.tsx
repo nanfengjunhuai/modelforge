@@ -37,7 +37,14 @@
 import dynamic from 'next/dynamic'
 import { useEffect, useMemo, useState } from 'react'
 
-import { formatBytes, isChartData, KIND_LABEL } from '@/lib/artifact-format'
+import {
+  extensionOf,
+  formatBytes,
+  groupArtifacts,
+  isChartData,
+  KIND_LABEL,
+  type ArtifactGroup,
+} from '@/lib/artifact-format'
 import {
   buildChartOption,
   buildChartTable,
@@ -45,6 +52,7 @@ import {
   type ChartSpec,
 } from '@/lib/chart-spec'
 import type { ChartTokens } from '@/lib/chart-tokens'
+import type { LogReportEvent } from '@/lib/log-types'
 import { artifactUrl } from '@/lib/sessions'
 import type { ArtifactRef } from '@/lib/stream-types'
 
@@ -70,29 +78,52 @@ const InteractiveChart = dynamic(() => import('./chart'), {
 export function ArtifactPanel({
   sessionId,
   artifacts,
+  reports,
   selectedId,
   onSelect,
+  onGenerate,
+  generating,
+  onOpenReport,
 }: {
   sessionId: string
   artifacts: ArtifactRef[]
+  /** 这个会话生成过的报告 —— 用来认出「这一组其实是一份报告」。 */
+  reports: LogReportEvent[]
   /** 当前选中的产物 id；null = 还没选。由 `page.tsx` 持有。 */
   selectedId: string | null
   onSelect: (artifactId: string | null) => void
+  onGenerate: () => void
+  generating: boolean
+  onOpenReport: (report: LogReportEvent) => void
 }) {
   const selected = artifacts.find((a) => a.id === selectedId) ?? null
+
+  // ⚠️ 分组结果要 memo：不 memo 的话每次渲染都是一个新数组，
+  //    而下面是 `groups.map(...)` —— 数组身份变了 React 就得全部重渲染。
+  //    流式生成时每秒几十次渲染，这个差别是真实存在的。
+  const groups = useMemo(() => groupArtifacts(artifacts), [artifacts])
 
   return (
     <div className="flex h-full flex-col">
       <div className="flex shrink-0 items-center gap-3 border-b border-hairline px-4 py-3">
         <h2 className="text-caption font-medium text-ink-secondary">产物</h2>
         <span className="font-mono text-caption text-ink-muted">
-          {artifacts.length}
+          {groups.length}
         </span>
+        <button
+          type="button"
+          onClick={onGenerate}
+          disabled={generating}
+          title="把这次会话整理成一篇论文草稿"
+          className="ml-auto shrink-0 rounded-control border border-hairline bg-surface px-2.5 py-1 text-caption text-ink-secondary transition-colors hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {generating ? '正在写……' : '生成报告'}
+        </button>
         {selected && (
           <button
             type="button"
             onClick={() => onSelect(null)}
-            className="ml-auto rounded-control px-2 py-1 text-caption text-ink-muted transition-colors hover:text-ink"
+            className="shrink-0 rounded-control px-2 py-1 text-caption text-ink-muted transition-colors hover:text-ink"
           >
             收起
           </button>
@@ -111,23 +142,32 @@ export function ArtifactPanel({
       )}
 
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {artifacts.length === 0 ? (
+        {groups.length === 0 ? (
           <EmptyState />
         ) : (
           <ul className="flex flex-col">
-            {artifacts.map((artifact) => (
-              <ArtifactRow
-                key={artifact.id}
+            {groups.map((group) => (
+              <ArtifactGroupRow
+                key={group.key}
                 sessionId={sessionId}
-                artifact={artifact}
-                selected={artifact.id === selectedId}
+                group={group}
+                selectedId={selectedId}
+                reportOf={reports.find((r) => groupHoldsReport(group, r)) ?? null}
                 onSelect={onSelect}
+                onOpenReport={onOpenReport}
               />
             ))}
           </ul>
         )}
       </div>
     </div>
+  )
+}
+
+/** 这一组里有没有某份报告的产物。 */
+function groupHoldsReport(group: ArtifactGroup, report: LogReportEvent): boolean {
+  return group.items.some(
+    (item) => item.id === report.document.id || item.id === report.sidecar.id,
   )
 }
 
@@ -142,48 +182,113 @@ function EmptyState() {
   )
 }
 
-function ArtifactRow({
+/**
+ * 产物清单里的**一行 = 一组同名文件**（M6a 起）。
+ *
+ * ════════════════════════════════════════════════════════════════
+ * 为什么要分组
+ * ════════════════════════════════════════════════════════════════
+ * `mp.save()` 一次写下三份（`.png` / `.pdf` / `.chart.json`），
+ * 报告又写两份（`.md` / `.report.json`）。不分组的清单看起来像
+ * **文件浏览器**，而这一栏想说的是「这个会话产出了什么」。
+ *
+ * 分组键是 `nameKey()`，和后端 `outline.py::name_key` 逐字对应 ——
+ * 两边不一致的话，图会配不到自己的 caption。
+ *
+ * ════════════════════════════════════════════════════════════════
+ * 报告那一组为什么不一样
+ * ════════════════════════════════════════════════════════════════
+ * 别的产物点开是「看」，报告点开也是「看」—— 但看的是**整篇文档**，
+ * 而不是某个文件。一份报告的意义在于被读，而 `.md` / `.report.json`
+ * 两个文件都是它的载体，让用户去分辨要点哪个是本末倒置。
+ * 所以报告那一组给的是「读报告」，下载退到次要位置。
+ */
+function ArtifactGroupRow({
   sessionId,
-  artifact,
-  selected,
+  group,
+  selectedId,
+  reportOf,
   onSelect,
+  onOpenReport,
 }: {
   sessionId: string
-  artifact: ArtifactRef
-  selected: boolean
+  group: ArtifactGroup
+  selectedId: string | null
+  reportOf: LogReportEvent | null
   onSelect: (artifactId: string | null) => void
+  onOpenReport: (report: LogReportEvent) => void
 }) {
+  // 组的「主产物」：图组里是那张图，报告组里是那个 `.md`。
+  // `groupArtifacts` 已经按 图 → 文档 → 数据 → 其他 排过序了。
+  const primary = group.items[0]
+  const selected = group.items.some((item) => item.id === selectedId)
+  const total = group.items.reduce((sum, item) => sum + item.size, 0)
+
   return (
-    <li>
+    <li className="border-b border-hairline last:border-0">
       <div
         className={`flex items-center gap-2 px-4 py-2.5 transition-colors ${
           selected ? 'bg-brand-50' : 'hover:bg-plane'
         }`}
       >
         <span className="shrink-0 rounded-control bg-raised px-1.5 py-0.5 text-caption text-ink-muted">
-          {KIND_LABEL[artifact.kind]}
+          {reportOf ? '报告' : KIND_LABEL[primary.kind]}
         </span>
-        <button
-          type="button"
-          // 再点一次收回查看器 —— 和折叠面板是同一个手势习惯。
-          onClick={() => onSelect(selected ? null : artifact.id)}
-          title={artifact.name}
-          className={`min-w-0 flex-1 truncate text-left text-caption transition-colors ${
-            selected ? 'text-brand-600' : 'text-ink-secondary hover:text-ink'
-          }`}
-        >
-          {artifact.name}
-        </button>
+        {reportOf ? (
+          <button
+            type="button"
+            onClick={() => onOpenReport(reportOf)}
+            title={group.label}
+            className={`min-w-0 flex-1 truncate text-left text-caption transition-colors ${
+              selected ? 'text-brand-600' : 'text-ink-secondary hover:text-ink'
+            }`}
+          >
+            {group.label}
+          </button>
+        ) : (
+          <button
+            type="button"
+            // 再点一次收回查看器 —— 和折叠面板是同一个手势习惯。
+            onClick={() => onSelect(selected ? null : primary.id)}
+            title={group.label}
+            className={`min-w-0 flex-1 truncate text-left text-caption transition-colors ${
+              selected ? 'text-brand-600' : 'text-ink-secondary hover:text-ink'
+            }`}
+          >
+            {group.label}
+          </button>
+        )}
         <span className="shrink-0 font-mono text-caption text-ink-muted">
-          {formatBytes(artifact.size)}
+          {formatBytes(total)}
         </span>
         <a
-          href={artifactUrl(sessionId, artifact.id, { download: true })}
+          href={artifactUrl(sessionId, primary.id, { download: true })}
           className="shrink-0 text-caption text-brand-600 hover:underline"
         >
           下载
         </a>
       </div>
+
+      {/* 组里不止一个文件时，把成员列出来 —— 否则用户会以为
+          `.pdf` 和 `.chart.json` 不见了（它们只是被收进了这一行）。 */}
+      {group.items.length > 1 && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 pb-2.5">
+          {group.items.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => onSelect(item.id === selectedId ? null : item.id)}
+              className={`font-mono text-caption transition-colors ${
+                item.id === selectedId
+                  ? 'text-brand-600'
+                  : 'text-ink-muted hover:text-ink-secondary'
+              }`}
+            >
+              {extensionOf(item.name).replace(/^\./, '') || '文件'}
+            </button>
+          ))}
+        </div>
+      )}
     </li>
   )
 }

@@ -36,7 +36,12 @@
  * 能算出来的东西就别存，存了就有不一致的风险。
  */
 
-import type { Decision, LoggedMessage, SessionDetail } from './log-types'
+import type {
+  Decision,
+  LoggedMessage,
+  LogReportEvent,
+  SessionDetail,
+} from './log-types'
 import type {
   ArtifactRef,
   FinishReason,
@@ -99,10 +104,34 @@ export type ChatState = {
   liveKey: string | null
   /** 面向用户的错误文案。原始报错只进控制台。 */
   error: string | null
+  /**
+   * 这个会话生成过的报告（M6a）。
+   *
+   * ⚠️ **它是「界面 = 日志的投影」这条设计的一部分，不是一块外挂的状态。**
+   * 报告是第八种日志事件（`LogReport`），所以它和对话消息一样，
+   * 有两条来路：实时（生成完的那一刻）和回放（刷新后 `fromSessionDetail`）。
+   * 两条路都往这里写，界面只读这一份。
+   *
+   * 顺带它也是产物清单的**第二个来源** —— 见 `allArtifacts`。
+   */
+  reports: LogReportEvent[]
 }
 
 export function emptyChat(): ChatState {
-  return { messages: [], liveKey: null, error: null }
+  return { messages: [], liveKey: null, error: null, reports: [] }
+}
+
+/**
+ * 新增一份报告。**按 `document.id` 去重**。
+ *
+ * 为什么需要去重：日志本身不会重复（append-only），但**前端可能收到两次** ——
+ * 比如生成到一半刷新页面，回放拿到了完整的 `reports`，而那条流还在往这里写。
+ * 重复的话产物清单里会多出一条一模一样的报告，点开是同一份内容。
+ * 那种「明明只生成过一次，怎么有两份」是最让人怀疑自己记性的一类 bug。
+ */
+export function applyReport(state: ChatState, report: LogReportEvent): ChatState {
+  const exists = state.reports.some((r) => r.document.id === report.document.id)
+  return exists ? state : { ...state, reports: [...state.reports, report] }
 }
 
 // ══════════════════════════════════════════════════════ 身份
@@ -157,10 +186,46 @@ export function allDecisions(state: ChatState): DecisionView[] {
  * 也因此它继承了一个**已知的**性质：文件在磁盘上被删掉了，
  * 这里仍然列得出来（日志只能 append，ADR-009）。点开时才会发现
  * 取不到 —— 那时面板给的是「文件已经不在了」，不是空白。
+ *
+ * ════════════════════════════════════════════════════════════════
+ * ⚠️ 产物有**两个**来源，不是一个（M6a 加的）
+ * ════════════════════════════════════════════════════════════════
+ * 上面那段说的是工具跑代码产出的文件 —— 它们挂在 `ToolResult.artifacts` 上。
+ *
+ * 而**报告不是工具调用产出的**（它由 `POST /sessions/{id}/report` 生成），
+ * 所以它的两个文件（`.md` + `.report.json`）挂在第八种日志事件
+ * `LogReport` 上，由 `state.reports` 带着。
+ *
+ * 漏掉第二个来源的症状很安静：报告在磁盘上、在 `reports` 里也有，
+ * 但**产物清单里看不到它** —— 而 `tsc` 和 eslint 都不会吭声，
+ * 因为少一个 `flatMap` 分支是完全合法的类型。
+ *
+ * 后端那一侧有一份逐字对应的实现（`sessions/project.py::list_artifacts`），
+ * 两边必须同时改。`tests/test_reports_api.py` 从后端那一侧盯着同一件事。
  */
 export function allArtifacts(state: ChatState): ArtifactRef[] {
-  return state.messages.flatMap((m) =>
-    m.tools.flatMap((t) => t.result?.artifacts ?? []),
+  return [
+    ...state.messages.flatMap((m) =>
+      m.tools.flatMap((t) => t.result?.artifacts ?? []),
+    ),
+    ...state.reports.flatMap((r) => [r.document, r.sidecar]),
+  ]
+}
+
+/**
+ * 找出某份报告 —— 按 `.report.json`（sidecar）的 id 找。
+ *
+ * 为什么按 sidecar 而不是按 `.md`：**能读的那一份是 sidecar**。
+ * 面板里点一条报告时要先把它读出来渲染，而 `.md` 是给下载用的。
+ */
+export function findReport(
+  state: ChatState,
+  artifactId: string,
+): LogReportEvent | null {
+  return (
+    state.reports.find(
+      (r) => r.sidecar.id === artifactId || r.document.id === artifactId,
+    ) ?? null
   )
 }
 
@@ -439,6 +504,8 @@ export function fromSessionDetail(detail: SessionDetail): ChatState {
   const decisionByCall = new Map<string, Decision>(
     detail.decisions.map((d) => [d.call_id, d]),
   )
+  // 报告直接读后端投影好的那一份，不从 `events` 里自己筛 ——
+  // 理由和 `decisions` 完全一样（见 `SessionDetail` 的说明）。
 
   const messages: Msg[] = []
 
@@ -506,10 +573,40 @@ export function fromSessionDetail(detail: SessionDetail): ChatState {
       case 'usage':
       case 'aborted':
         break
+
+      // 报告也一样：它归 `detail.reports`（后端投影好的那份），
+      // 这个循环只负责产出**对话消息**，所以这里什么都不做。
+      case 'report':
+        break
+
+      default: {
+        // ══════════════════════════════════════════════════════════
+        // ⚠️ 穷尽性断言 —— **别删这一块**。
+        // ══════════════════════════════════════════════════════════
+        // 判别联合本身**不会**让 switch 变成穷尽性检查：
+        // `strict: true` 不强制它，而这个 switch 后面还有代码，
+        // 所以少写一个 `case` 编译能过、测试全绿、界面上少一块东西。
+        //
+        // M6a 加第八种事件（`report`）时就是这么发现的 ——
+        // 当时 `log-types.ts` 的注释里还写着「判别联合会让 switch 有穷尽性检查」，
+        // 那句话是错的，已改。
+        //
+        // 有了这一行，下次后端加一种日志事件时，**`tsc` 会直接报错**，
+        // 而不是等到有人刷新页面发现少了东西。
+        const unhandled: never = event
+        throw new Error(
+          `fromSessionDetail 没有处理这种日志事件：${JSON.stringify(unhandled)}`,
+        )
+      }
     }
   }
 
-  return { messages, liveKey: null, error: null }
+  return {
+    messages,
+    liveKey: null,
+    error: null,
+    reports: detail.reports ?? [],
+  }
 }
 
 /** 把结果挂到**最后一条**含这个 call_id 的助手消息上。 */

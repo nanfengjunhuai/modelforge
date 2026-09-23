@@ -12,7 +12,7 @@ token 用量，全都按真实顺序躺在那里。
 投影就是从前者算出后者的那个纯函数。它没有 I/O、不碰数据库，
 所以可以用手写的事件列表**穷举测试** —— 这正是它值得单独成一层的原因。
 
-    events（七种 kind）  ──project_messages──►  list[Message]  ──►  Provider
+    events（八种 kind）  ──project_messages──►  list[Message]  ──►  Provider
 
 ════════════════════════════════════════════════════════════════════════
 `project_messages` **必须是全函数**（这是本文件最重要的设计）
@@ -55,6 +55,7 @@ from modelforge.sessions.base import (
     LogDecisionAnswer,
     LogDecisionRequest,
     LogEvent,
+    LogReport,
     LogTool,
     LogUser,
     SessionStatus,
@@ -70,6 +71,7 @@ __all__ = [
     "find_artifact",
     "list_artifacts",
     "list_decisions",
+    "list_reports",
     "pending_decision",
     "project_messages",
 ]
@@ -176,8 +178,10 @@ def project_messages(items: Sequence[StoredEvent | LogEvent]) -> list[Message]:
 
         # LogTool / LogDecisionAnswer 在第二遍里**故意跳过**：
         # 它们已经在上面跟着所属的 assistant 消息一起输出了。
-        # LogDecisionRequest / LogUsage / LogAborted 同理 —— 它们不投影成消息
-        # （前者的信息在 assistant 的 tool_calls 里，后两者根本不属于对话内容）。
+        # LogDecisionRequest / LogUsage / LogAborted / LogReport 同理 ——
+        # 它们不投影成消息：第一个的信息在 assistant 的 tool_calls 里，
+        # 后三个根本不属于对话内容（报告是**关于**这次对话的产物，
+        # 不该变成模型下一轮要读的一段历史）。
     return messages
 
 
@@ -323,8 +327,16 @@ def list_artifacts(items: Sequence[StoredEvent | LogEvent]) -> list[ArtifactRef]
     """按时间顺序列出这个会话产出的全部产物。
 
     和 `list_decisions` 是同一类东西：**从事件日志里读回来的、给界面用的视图**。
-    界面上刷新一下图还在，靠的就是它 —— 因为产物引用是被存进 `tool` 事件的
-    `result.artifacts` 里的（见 `ToolResult.artifacts` 的说明）。
+    界面上刷新一下图还在，靠的就是它 —— 因为产物引用是被存进事件里的
+    （见 `ToolResult.artifacts` 的说明）。
+
+    ⚠️ **这里有两个来源，不是一个。** M6a 之前只有 `tool` 事件：
+    模型跑代码时把文件写进 `artifacts/`，执行结束被扫走，引用挂在
+    `ToolResult.artifacts` 上。
+
+    而报告（`LogReport`）是 REST 端点直接产出的，**没有工具调用** ——
+    忘了收集它的话，症状是「报告生成成功了、磁盘上也有，但刷新之后
+    产物清单里没有它」。所以加第八种事件时，这一行和它上面那一行同等重要。
 
     注意这里**不碰磁盘**。它回答的是「日志说产出过什么」，而不是
     「盘上现在有什么」。两者可能有出入（文件被手动删了），那是文件系统的问题，
@@ -335,7 +347,30 @@ def list_artifacts(items: Sequence[StoredEvent | LogEvent]) -> list[ArtifactRef]
         event = _unwrap(item)
         if isinstance(event, LogTool):
             found.extend(event.result.artifacts)
+        elif isinstance(event, LogReport):
+            found.extend((event.document, event.sidecar))
     return found
+
+
+def list_reports(items: Sequence[StoredEvent | LogEvent]) -> list[LogReport]:
+    """按时间顺序列出这个会话生成过的报告。
+
+    和 `list_decisions` 一样，是**从日志读回来的、给界面用的视图**。
+    存在的理由也一样：前端要判断「这份产物是个报告，点开能读」，
+    而那个判断需要 `LogReport` 这条记录本身（它同时带着 `.md` 和
+    `.report.json` 两个引用，前端据此配对）。
+
+    直接返回 `LogReport` 而不是再造一个视图模型 —— 这条记录里
+    没有任何「给存储看的」字段需要剥掉（对比 `Decision`：那个要
+    把两种事件里散落的字段拼起来，所以才值得单独一个类型）。
+    """
+    reports: list[LogReport] = []
+    for item in items:
+        event = _unwrap(item)
+        if isinstance(event, LogReport):
+            reports.append(event)
+    return reports
+
 
 
 def find_artifact(items: Sequence[StoredEvent | LogEvent], artifact_id: str) -> ArtifactRef | None:

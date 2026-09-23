@@ -65,7 +65,7 @@ export type StreamChatOptions = {
 }
 
 /** 一帧 SSE 的原始形态，还没做 JSON 解析。 */
-type RawFrame = {
+export type RawFrame = {
   event: string
   data: string
 }
@@ -122,7 +122,9 @@ function parseFrame(raw: string): RawFrame | null {
  *
  * 这是整个文件的核心。「一次 read 不等于一帧」这件事全在这里处理。
  */
-async function* readFrames(body: ReadableStream<Uint8Array>): AsyncGenerator<RawFrame> {
+export async function* readFrames(
+  body: ReadableStream<Uint8Array>,
+): AsyncGenerator<RawFrame> {
   // getReader() 是「独占读取」：拿到 reader 之后，这条流就只能由它读了。
   // 用完必须 releaseLock()，否则这条流会一直被占着。
   const reader = body.getReader()
@@ -249,7 +251,7 @@ async function* postStream(
  * （我们抛的 HTTPException）也可能是**对象数组**（Pydantic 的校验错误）。
  * 直接 `text.slice()` 显示出来的话，用户会看到一坨 JSON。
  */
-function describeHttpError(status: number, raw: string): string {
+export function describeHttpError(status: number, raw: string): string {
   const detail = raw.slice(0, 300)
   try {
     const parsed: unknown = JSON.parse(raw)

@@ -41,10 +41,15 @@ ADR-002 说的「状态落盘 + 点击时重建」，落点就在这一层。
 
 所以租约写在数据库里（`sessions.lease_until`），抢占用一条带条件的 UPDATE：
 
-    UPDATE sessions SET lease_until = ?
+    UPDATE sessions SET lease_until = ?, lease_token = ?
     WHERE id = ? AND (lease_until IS NULL OR lease_until < ?)
 
 `rowcount == 0` 就是「有人正在用」。多进程、多机都认这条。
+
+⚠️ **`lease_token` 是 M6a 加的，它修的是「释放」那一半。** 光有抢占没有
+所有权，一个跑得比 TTL 还慢的请求跑完时会**放掉别人的租约**
+（详见 `sessions/base.py::acquire_lease`）。所以抢到租约的那个协程会拿到
+一个令牌，还租约时必须交回来 —— 对不上就什么都不做。
 
 ⚠️ 配套的一条：`main.py` 的 lifespan 启动时必须 `clear_all_leases()`。
    不调用的话，上次进程被强杀（而不是优雅退出）留下的租约会让那个会话
@@ -74,6 +79,7 @@ from modelforge.sandbox.tools import ASK_USER_SPEC, TOOL_SPECS
 from modelforge.sessions.base import (
     LogAborted,
     LogDecisionAnswer,
+    LogReport,
     LogUser,
     Session,
     SessionStore,
@@ -84,12 +90,20 @@ from modelforge.sessions.project import (
     build_messages,
     derive_status,
     list_decisions,
+    list_reports,
 )
 from modelforge.sessions.sqlite_store import SessionRecorder, SqliteSessionStore
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["get_store", "router"]
+__all__ = [
+    "acquire_or_409",
+    "get_store",
+    "load_or_404",
+    "resolve_provider",
+    "router",
+    "shielded",
+]
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
@@ -130,6 +144,19 @@ class SessionDetail(BaseModel):
     让前端自己拼等于把投影逻辑在前端抄了第二份。
     """
 
+    reports: list[LogReport] = []
+    """生成过的报告（M6a）。理由同上。
+
+    ⚠️ **它同时也是这一轮最重要的一道防线。** 产物的前端路径是
+    「扫 `events` 里 `kind === 'tool'` 的结果」—— 而 `report` 是**第八种** kind，
+    前端的 reducer 少一个 `case` **不会编译报错**（那个 switch 没有穷尽性断言，
+    末尾还有 return），于是报告在刷新后会静默消失，而所有 pytest 都是绿的。
+
+    把 reports 显式投影出来，就不必指望前端记得加那个 case。TS 那边
+    仍然要加（契约测试会红），但「忘了加」的后果从「功能没了」降级成
+    「多一份没用到的类型」。
+    """
+
 
 class NewMessage(BaseModel):
     content: str = Field(min_length=1, max_length=8000)
@@ -151,7 +178,7 @@ class DecisionSubmission(BaseModel):
 # ══════════════════════════════════════════════════════ 小工具
 
 
-async def _shielded(coro: object) -> None:
+async def shielded(coro: object) -> None:
     """跑一个清理动作，**即使当前协程正在被取消**。
 
     为什么需要这个？因为 Starlette 在浏览器断开时会取消跑着我们生成器的那个
@@ -170,22 +197,28 @@ async def _shielded(coro: object) -> None:
         await asyncio.shield(coro)  # type: ignore[arg-type]
 
 
-async def _load_or_404(store: SessionStore, session_id: str) -> Session:
+async def load_or_404(store: SessionStore, session_id: str) -> Session:
     session = await store.get(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"没有这个会话：{session_id}")
     return session
 
 
-async def _acquire_or_409(store: SessionStore, session_id: str) -> None:
-    """抢占会话，抢不到就 409。
+async def acquire_or_409(store: SessionStore, session_id: str) -> str:
+    """抢占会话，抢不到就 409。**成功时返回所有权令牌**，调用方必须把它
+    一路带到 `release_lease(session_id, token=...)`。
 
     **这是真正的并发闸门。** 上层那些状态校验（status 是不是 idle）只是
     为了让错误信息更好懂 —— 它们都有 TOCTOU 窗口，两个并发请求可以同时通过。
     只有这条带条件的 UPDATE 是原子的。
+
+    令牌为什么要出现在签名里：释放时不带令牌 = 无条件释放，而一个跑得比
+    TTL 还慢的请求（报告生成必然如此）会把**已经换手给别人**的租约放掉。
+    详见 `sessions/base.py` 里 `acquire_lease` 的那段说明。
     """
     settings = get_settings()
-    if not await store.acquire_lease(session_id, seconds=settings.session_lease_seconds):
+    token = await store.acquire_lease(session_id, seconds=settings.session_lease_seconds)
+    if token is None:
         raise HTTPException(
             status_code=409,
             detail=(
@@ -193,9 +226,10 @@ async def _acquire_or_409(store: SessionStore, session_id: str) -> None:
                 "等它跑完再试；如果确定没有在跑，稍等一会儿租约会自动过期。"
             ),
         )
+    return token
 
 
-def _resolve_provider(name: str | None) -> ChatProvider:
+def resolve_provider(name: str | None) -> ChatProvider:
     """取 Provider，把配置类错误翻译成 HTTP 400。
 
     复用 `chat.py` 的 `acquire_provider`（**必须**复用，不能自己造一个）——
@@ -221,6 +255,7 @@ def _stream_response(
     session_id: str,
     messages: list[Message],
     provider_name: str | None,
+    lease_token: str,
 ) -> StreamingResponse:
     """把一次 `run_agent_turn` 包成 SSE 响应，并负责租约的释放。
 
@@ -228,10 +263,13 @@ def _stream_response(
     并需要返回 409（一个 HTTP 状态码，必须在流开始之前发出去），
     而「还」永远发生在流结束之后。
 
+    `lease_token` 是抢租约时拿到的凭证，原样交还给 `release_lease` ——
+    这东西一旦中途丢了，释放就会变成无条件的，见 `acquire_or_409`。
+
     `temperature` / `max_tokens` 暂时写死在调用点。等 M5 做了「设置」
     面板再从这里透出去 —— 现在多传两个没人改的参数只是噪音。
     """
-    provider = _resolve_provider(provider_name)
+    provider = resolve_provider(provider_name)
 
     async def event_stream() -> AsyncIterator[str]:
         try:
@@ -258,7 +296,7 @@ def _stream_response(
             # 用户看到过的字刷新后会消失 —— 这是 M4 明确接受的代价，
             # 详见 ADR-009。
             logger.info("会话 %s 的流被客户端中断", session_id)
-            await _shielded(store.append(session_id, LogAborted(reason="客户端断开连接")))
+            await shielded(store.append(session_id, LogAborted(reason="客户端断开连接")))
             raise
 
         except Exception as exc:
@@ -267,13 +305,15 @@ def _stream_response(
             # 即便如此也必须补一个 Finish —— 契约（Finish 一定最后出现）
             # 是跨层承诺，每一层都有责任维护它。
             logger.exception("会话 %s 的流异常终止", session_id)
-            await _shielded(store.append(session_id, LogAborted(reason=f"{type(exc).__name__}")))
+            await shielded(store.append(session_id, LogAborted(reason=f"{type(exc).__name__}")))
             yield format_sse(ErrorEvent(message=f"{type(exc).__name__}: {exc}"))
             yield format_sse(Finish(reason="error"))
 
         finally:
             # 无论怎么结束都要还租约，哪怕上面已经 raise 了。
-            await _shielded(store.release_lease(session_id))
+            # 带上令牌 —— 如果这条租约已经过期并被别人接管，这个调用会
+            # 什么也不做，而不是把别人的租约放掉。
+            await shielded(store.release_lease(session_id, token=lease_token))
 
     return StreamingResponse(
         event_stream(),
@@ -308,10 +348,13 @@ async def get_session(session_id: str) -> SessionDetail:
     折叠成视图模型，实时路径和回放路径喂给它的是同一种输入。
     """
     store = get_store()
-    session = await _load_or_404(store, session_id)
+    session = await load_or_404(store, session_id)
     events = await store.events(session_id)
     return SessionDetail(
-        session=session, events=events, decisions=list_decisions(events)
+        session=session,
+        events=events,
+        decisions=list_decisions(events),
+        reports=list_reports(events),
     )
 
 
@@ -365,8 +408,8 @@ async def send_message(
     或者直接 curl 都能绕过去。服务端这道门才是真的门。
     """
     store = get_store()
-    await _load_or_404(store, session_id)
-    await _acquire_or_409(store, session_id)
+    await load_or_404(store, session_id)
+    lease_token = await acquire_or_409(store, session_id)
 
     try:
         events = await store.events(session_id)
@@ -381,7 +424,7 @@ async def send_message(
         messages = build_messages(events)
     except Exception:
         # 抢到租约之后的任何失败都必须还回去，否则这个会话要卡到租约过期。
-        await store.release_lease(session_id)
+        await store.release_lease(session_id, token=lease_token)
         raise
 
     return _stream_response(
@@ -389,6 +432,7 @@ async def send_message(
         session_id=session_id,
         messages=messages,
         provider_name=None,
+        lease_token=lease_token,
     )
 
 
@@ -408,8 +452,8 @@ async def submit_decision(
     都无所谓。
     """
     store = get_store()
-    await _load_or_404(store, session_id)
-    await _acquire_or_409(store, session_id)
+    await load_or_404(store, session_id)
+    lease_token = await acquire_or_409(store, session_id)
 
     try:
         events = await store.events(session_id)
@@ -444,7 +488,7 @@ async def submit_decision(
         events = await store.events(session_id)
         messages = build_messages(events)
     except Exception:
-        await store.release_lease(session_id)
+        await store.release_lease(session_id, token=lease_token)
         raise
 
     return _stream_response(
@@ -452,6 +496,7 @@ async def submit_decision(
         session_id=session_id,
         messages=messages,
         provider_name=None,
+        lease_token=lease_token,
     )
 
 
@@ -474,8 +519,8 @@ async def resume_session(session_id: str, request: Request) -> StreamingResponse
     真要滥用的话，前端的按钮比这个端点好管得多。
     """
     store = get_store()
-    await _load_or_404(store, session_id)
-    await _acquire_or_409(store, session_id)
+    await load_or_404(store, session_id)
+    lease_token = await acquire_or_409(store, session_id)
 
     try:
         events = await store.events(session_id)
@@ -486,7 +531,7 @@ async def resume_session(session_id: str, request: Request) -> StreamingResponse
             )
         messages = build_messages(events)
     except Exception:
-        await store.release_lease(session_id)
+        await store.release_lease(session_id, token=lease_token)
         raise
 
     return _stream_response(
@@ -494,4 +539,5 @@ async def resume_session(session_id: str, request: Request) -> StreamingResponse
         session_id=session_id,
         messages=messages,
         provider_name=None,
+        lease_token=lease_token,
     )

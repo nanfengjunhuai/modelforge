@@ -44,6 +44,7 @@ import {
   abortStream,
   allArtifacts,
   applyEvent,
+  applyReport,
   emptyChat,
   failWith,
   fromSessionDetail,
@@ -54,8 +55,18 @@ import {
   startTurn,
   type ChatState,
 } from '@/lib/chat-state'
-import type { Session } from '@/lib/log-types'
+import type { LogReportEvent, Session } from '@/lib/log-types'
+import type { ReportDocument } from '@/lib/report-types'
 import {
+  applyReportFrame,
+  emptyProgress,
+  progressFromDocument,
+  startProgress,
+  streamReport,
+  type ReportProgress,
+} from '@/lib/report-stream'
+import {
+  artifactUrl,
   createSession,
   deleteSession,
   getSession,
@@ -66,6 +77,7 @@ import type { StreamEvent } from '@/lib/stream-types'
 
 import { Conversation } from './conversation'
 import { ArtifactPanel } from './panel'
+import { ReportOverlay } from './report'
 import { SessionSidebar } from './sidebar'
 
 // ══════════════════════════════════════════════════════ URL 里的会话 id
@@ -145,15 +157,28 @@ export default function ChatPage() {
   const [panelOpen, setPanelOpen] = useState(true)
   const [openArtifactId, setOpenArtifactId] = useState<string | null>(null)
 
+  // ── 报告（M6a）──
+  //
+  // `progress` 是**界面唯一认的那一份**：正在生成时由流一帧帧喂，
+  // 打开一份旧报告时由 `.report.json` 一次性灌。两条路都汇到这一个状态，
+  // 所以「刚写的」和「昨天写的」渲染出来一模一样。
+  const [progress, setProgress] = useState<ReportProgress | null>(null)
+  const [reportOpen, setReportOpen] = useState(false)
+
   // 取消正在进行的请求。useRef 而不是 useState：它只是个「手柄」，
   // 变了不需要重新渲染。
   const abortRef = useRef<AbortController | null>(null)
+  const reportAbortRef = useRef<AbortController | null>(null)
 
-  // ⚠️ 两个请求令牌，防的是上面「三处竞态」的 ① 和 ②。
+  // ⚠️ 三个请求令牌，防的是上面「三处竞态」的 ① 和 ②。
   // 用递增的整数而不是布尔：连续切三次会话时，需要知道
   // 「现在的最新一次是哪一次」，而不只是「有没有被顶掉」。
   const loadSeqRef = useRef(0)
   const streamSeqRef = useRef(0)
+  // ③ 报告流有它自己的令牌和 abort 手柄，**不和聊天流共用** ——
+  //    两条流的生命周期完全独立（报告不消耗对话轮次，也不写对话历史），
+  //    共用一个手柄的话，切会话时先 abort 谁、令牌归谁都会变得说不清。
+  const reportSeqRef = useRef(0)
 
   // ⚠️ 这个 ref 守卫的是 **React 开发模式的 StrictMode 双调用**。
   //
@@ -208,6 +233,12 @@ export default function ChatPage() {
     streamSeqRef.current += 1
     abortRef.current?.abort()
     abortRef.current = null
+
+    // 报告流也要一起掐。切走之后它还往这里推帧的话，新会话的界面里
+    // 会长出一份**别人**的报告 —— 而且它看起来完全正常，只是内容对不上。
+    reportSeqRef.current += 1
+    reportAbortRef.current?.abort()
+    reportAbortRef.current = null
   }
 
   // ────────────────────────────────────────── 会话生命周期
@@ -229,6 +260,10 @@ export default function ChatPage() {
     setSessionIdInUrl(id)
     setState(emptyChat())
     setOpenArtifactId(null)
+    // 报告是**这个会话的**产物，切走就得一起收掉 ——
+    // 留着的话，新会话的界面上会挂着一份别的会话的报告。
+    setProgress(null)
+    setReportOpen(false)
     setBootError(null)
     setBootPhase('connecting')
 
@@ -255,6 +290,8 @@ export default function ChatPage() {
     setState(emptyChat())
     setSessionId(null)
     setOpenArtifactId(null)
+    setProgress(null)
+    setReportOpen(false)
     setBootError(null)
     setBootPhase('connecting')
 
@@ -484,6 +521,95 @@ export default function ChatPage() {
     setPanelOpen(true)
   }
 
+  // ────────────────────────────────────────── 报告
+
+  /**
+   * 生成一份报告，**边生成边显示**。
+   *
+   * 一上来就把 overlay 打开、显示空壳 —— 而不是等全部写完再弹。
+   * 报告是四节、每节一次模型调用，全程几十秒；让用户盯着一个按钮转圈，
+   * 和看着它一节一节长出来，是完全不同的两种体验。
+   */
+  async function generateReport() {
+    if (!sessionId || reportGenerating) return
+
+    const controller = new AbortController()
+    reportAbortRef.current = controller
+    const token = ++reportSeqRef.current
+
+    setProgress(startProgress())
+    setReportOpen(true)
+
+    try {
+      for await (const frame of streamReport(sessionId, controller.signal)) {
+        // 切走了 —— 这条流已经不属于当前界面了。
+        if (reportSeqRef.current !== token) return
+
+        setProgress((prev) => applyReportFrame(prev ?? emptyProgress(), frame))
+
+        // 落盘之后把新报告插进产物清单。**必须在这里做**：
+        // 面板读的是 `state.reports`，不插的话报告要刷新一次才出现 ——
+        // 而用户刚刚才看着它写完。
+        if (frame.name === 'report_done') {
+          setState((prev) => applyReport(prev, frame.data.report))
+        }
+      }
+    } catch (err) {
+      if (reportSeqRef.current !== token) return
+      if (err instanceof DOMException && err.name === 'AbortError') return
+      console.error('生成报告失败：', err)
+      setProgress((prev) => ({
+        ...(prev ?? emptyProgress()),
+        running: false,
+        error: describeFailure(err),
+      }))
+    } finally {
+      if (reportAbortRef.current === controller) reportAbortRef.current = null
+    }
+  }
+
+  /**
+   * 打开一份**已经生成过的**报告（刷新之后点产物清单里的那一条）。
+   *
+   * 读的是 `.report.json` 而不是 `.md`：应用内视图需要知道
+   * 「哪一块是模型写的、哪一块是程序投影的」，而 Markdown 把两者压成了
+   * 同一种文本，那个区别就没了。要 Markdown 的话有「下载」。
+   *
+   * ⚠️ 这里**没有**重新跑模型的可能 —— 报告是已经落盘的产物，
+   * 打开它不该花一分钱 token。
+   */
+  async function openReport(report: LogReportEvent) {
+    if (!sessionId) return
+    const token = ++reportSeqRef.current
+
+    setProgress(startProgress())
+    setReportOpen(true)
+
+    try {
+      const response = await fetch(artifactUrl(sessionId, report.sidecar.id))
+      if (!response.ok) {
+        throw new Error(
+          response.status === 404
+            ? '这份报告的文件已经不在磁盘上了。'
+            : `取报告失败（HTTP ${response.status}）。`,
+        )
+      }
+      const document = (await response.json()) as ReportDocument
+      if (reportSeqRef.current !== token) return
+      setProgress(progressFromDocument(document, report))
+    } catch (err) {
+      if (reportSeqRef.current !== token) return
+      console.error('打开报告失败：', err)
+      setProgress((prev) => ({
+        ...(prev ?? emptyProgress()),
+        running: false,
+        error: describeFailure(err),
+      }))
+    }
+  }
+
+  const reportGenerating = progress?.running ?? false
+
   // ────────────────────────────────────────── 渲染
 
   const statusLine = awaiting
@@ -572,10 +698,26 @@ export default function ChatPage() {
             key={sessionId}
             sessionId={sessionId}
             artifacts={artifacts}
+            reports={state.reports}
             selectedId={openArtifactId}
             onSelect={setOpenArtifactId}
+            onGenerate={() => void generateReport()}
+            generating={reportGenerating}
+            onOpenReport={(report) => void openReport(report)}
           />
         </aside>
+      )}
+
+      {/* ════════ 报告 ════════
+          整页 overlay 而不是第三栏里的一块：一份数模论文塞进 400px
+          等于从门缝里读报纸。状态归这个组件，没有多开一个路由 ——
+          新路由要重做一遍数据加载、会话切换和错误处理。 */}
+      {reportOpen && progress && sessionId && (
+        <ReportOverlay
+          progress={progress}
+          sessionId={sessionId}
+          onClose={() => setReportOpen(false)}
+        />
       )}
     </main>
   )

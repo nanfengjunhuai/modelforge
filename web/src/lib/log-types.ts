@@ -16,10 +16,19 @@
  * 另一个信号是判别子：看到 `type` 就是流事件，看到 `kind` 就是日志记录。
  * 后端刻意这么定的，前端跟着用。
  *
- * ⚠️ 和后端是**手动同步**的。防线有两层：
- *   ① 后端 `tests/test_event_contract.py` 比对两边的 kind 集合**和
- *      每种事件的字段名集合** —— 把 `call_id` 写成 `callId` 会直接红；
- *   ② 下面的判别联合会让 `switch` 有穷尽性检查。
+ * ⚠️ 和后端是**手动同步**的。防线**只有一层**，说清楚它是什么：
+ *
+ *     后端 `tests/test_event_contract.py` 比对两边的 kind 集合**和
+ *     每种事件的字段名集合** —— 把 `call_id` 写成 `callId` 会直接红。
+ *
+ * 这一层是**必须的**，因为 TS 这边没有第二层：判别联合本身**不会**让
+ * `switch` 变成穷尽性检查 —— `strict: true` 不强制它，而 `fromSessionDetail`
+ * 的 switch 末尾还有一个 `return`，所以漏掉一个 kind 会静默落进 default，
+ * 编译通过、测试全绿、界面上少一块东西。
+ *
+ * （这里原先写着「② 下面的判别联合会让 switch 有穷尽性检查」—— 那句话是错的，
+ *  M6a 加第八种事件时才发现。真正的做法是在那个 switch 的 default 里写一句
+ *  `const _never: never = event`，让它变成编译错误。见 `chat-state.ts`。）
  */
 
 import type { ArtifactRef } from './stream-types'
@@ -67,7 +76,7 @@ export type LoggedToolResult = {
   artifacts: ArtifactRef[]
 }
 
-// ══════════════════════════════════════════════════════ 七种记录
+// ══════════════════════════════════════════════════════ 八种记录
 
 /** 用户说的一句话。 */
 export type LogUserEvent = {
@@ -125,6 +134,31 @@ export type LogAbortedEvent = {
   reason: string
 }
 
+/**
+ * 一份生成的报告（M6a）—— 它由 REST 端点产出，**不是一次工具调用**。
+ *
+ * ⚠️ **这条记录存在的唯一理由是：产物引用得有地方进日志。**
+ * 在它之前，产物只有一个来源 —— `LogToolEvent.result.artifacts`。
+ * 而报告是用户点「生成报告」之后由 `POST /sessions/{id}/report` 产出的，
+ * 那里根本没有工具调用。不记这一条的话，报告在磁盘上、在界面上却看不见，
+ * 刷新一次就消失。
+ *
+ * 后端认真考虑过「伪造一条 `LogToolEvent` 把产物塞进去」这个零改动方案，
+ * 否决了 —— 代价是界面上会多出一张幽灵工具卡片。见 ADR-016。
+ */
+export type LogReportEvent = {
+  kind: 'report'
+  /** 报告的标题。同时是那两个产物的显示名（`<标题>.md` / `<标题>.report.json`）。 */
+  title: string
+  /** 给人看的那份 —— Markdown，可下载。 */
+  document: ArtifactRef
+  /** 给程序看的那份 —— 报告的结构化块（`ReportDocument`），应用内视图用。 */
+  sidecar: ArtifactRef
+  /** 这份报告是哪个模型写的。空串表示当时没取到。 */
+  provider: string
+  model: string
+}
+
 export type LogEvent =
   | LogUserEvent
   | LogAssistantEvent
@@ -133,6 +167,7 @@ export type LogEvent =
   | LogDecisionAnswerEvent
   | LogUsageEvent
   | LogAbortedEvent
+  | LogReportEvent
 
 /** 日志里的一行：一个事件 + 它在会话中的位置。 */
 export type StoredEvent = {
@@ -186,4 +221,15 @@ export type SessionDetail = {
   session: Session
   events: StoredEvent[]
   decisions: Decision[]
+  /**
+   * 生成过的报告（M6a）。
+   *
+   * ⚠️ **它同时也是一道防线，别删。** 产物清单的前端路径是「扫 `events`
+   * 里 `kind === 'tool'` 的结果」，而 `report` 是**第八种** kind ——
+   * reducer 少一个 case **不会编译报错**（那个 switch 没有穷尽性断言），
+   * 于是报告会静默消失，而所有 pytest 都是绿的。
+   *
+   * 由后端显式投影出来，就不必指望前端记得加那个 case。
+   */
+  reports: LogReportEvent[]
 }

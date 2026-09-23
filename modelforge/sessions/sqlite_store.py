@@ -40,8 +40,13 @@ SQLite 的四个静默陷阱
 
   ④ `journal_mode` 默认是 DELETE，读写互斥。WAL 让读不阻塞写。
 
-（④ 是持久设置，写一次就记在数据库文件里；①②③ 都是每连接设置。
-这个区别本身也是个坑，所以四条都在 `_connect()` 里无条件执行一遍 ——
+  ⑤ **`CREATE TABLE IF NOT EXISTS` 不会给一张已存在的表加列。**
+     在开发机上永远看不出来（库删了重建就好），在别人的机器上是启动就炸。
+     和上面四条的区别是它**不静默** —— 报「no such column」，
+     只是那句话完全不提「你忘了迁移」。处理见 `_migrate()`。
+
+（④ 是持久设置，写一次就记在数据库文件里；①②③⑤ 都是每次建连接要过一遍的。
+这个区别本身也是个坑，所以 `_connect()` 里把它们无条件执行一遍 ——
 重复设置没有代价，漏掉有。）
 """
 
@@ -100,6 +105,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     title       TEXT NOT NULL,
     status      TEXT NOT NULL,
     lease_until REAL,                 -- unix 时间戳；NULL = 空闲
+    lease_token TEXT,                 -- 当前持有者的凭证；NULL = 空闲
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -119,6 +125,38 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_answer_per_call
     ON events(session_id, json_extract(payload, '$.call_id'))
     WHERE kind = 'decision_answer';
 """
+
+
+_COLUMNS_ADDED_LATER: list[tuple[str, str, str]] = [
+    # (表, 列名, 建列语句)。M6a 加的：租约的所有权凭证，见 acquire_lease。
+    ("sessions", "lease_token", "ALTER TABLE sessions ADD COLUMN lease_token TEXT"),
+]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """把 `_SCHEMA` 里新加的列补到**已经存在**的数据库上。
+
+    ⚠️ **`CREATE TABLE IF NOT EXISTS` 不会修改一张已经存在的表。**
+
+    这句话值得单独写一段，因为它是 SQLite（以及多数数据库）最容易被误读的
+    行为之一：在一个有数据的库上启动新版本，`_SCHEMA` 里新加的那一列
+    **一声不吭地不生效**，然后第一条用到它的 UPDATE 抛「no such column」——
+    报错指向的是那行 SQL，完全不会让人想到「表没迁移」。
+    而开发机上还复现不了（开发机的库早就删掉重建过了）。
+
+    所以每加一列要对**两处**负责：
+      · `_SCHEMA` 里写上 —— 给新建的库用
+      · 这里登记一条 —— 给已经在用的库用
+    两处都要改是这个方案的代价，换来的是不必引入 Alembic 那套迁移框架。
+
+    判据用 `PRAGMA table_info` 而不是「先 ALTER 再 catch 重复列名」：
+    后者的 except 会把「表根本不存在」这类真错误一起吞掉。
+    """
+    for table, column, ddl in _COLUMNS_ADDED_LATER:
+        # 表名和 DDL 都是这个文件里的字面量，不接受任何外部输入。
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(ddl)
 
 
 def _now_iso() -> str:
@@ -162,6 +200,7 @@ class SqliteSessionStore:
         conn.execute("PRAGMA journal_mode = WAL")    # 陷阱 ④
         conn.execute("PRAGMA foreign_keys = ON")     # 陷阱 ①
         conn.executescript(_SCHEMA)
+        _migrate(conn)   # 陷阱 ⑤：IF NOT EXISTS 不改已存在的表
         return conn
 
     async def _run(self, work: Callable[[sqlite3.Connection], T]) -> T:
@@ -310,12 +349,16 @@ class SqliteSessionStore:
 
     # ────────────────────────────────────────────── 租约
 
-    async def acquire_lease(self, session_id: str, *, seconds: float = 120.0) -> bool:
-        """抢占会话。已经有人占着且租约未过期时返回 False。
+    async def acquire_lease(self, session_id: str, *, seconds: float = 120.0) -> str | None:
+        """抢占会话。成功返回所有权令牌，已经有人占着且未过期时返回 None。
 
         整件事是一条带条件的 `UPDATE`，所以**原子性由数据库给**，
         不需要任何应用层的锁。这是把它放进数据库（而不是进程内的
         `asyncio.Lock`）的核心收益：多进程、多机都认这个租约。
+
+        令牌在这一条语句里和 `lease_until` **一起**写进去 —— 不能拆成
+        「先 UPDATE 再 SELECT」，那样两条并发请求会读到同一个令牌，
+        等于令牌制度根本不存在。
 
         `lease_until` 存的是 unix 时间戳（REAL）而不是 ISO 字符串，
         因为比较要用数字。ISO 字符串的字典序比较**大体上**能用，
@@ -324,28 +367,49 @@ class SqliteSessionStore:
         """
         now = datetime.now(UTC)
         until = (now + timedelta(seconds=seconds)).timestamp()
+        token = uuid.uuid4().hex
 
         def work(conn: sqlite3.Connection) -> bool:
             cursor = conn.execute(
-                "UPDATE sessions SET lease_until = ?, updated_at = ? "
+                "UPDATE sessions SET lease_until = ?, lease_token = ?, updated_at = ? "
                 "WHERE id = ? AND (lease_until IS NULL OR lease_until < ?)",
-                (until, _now_iso(), session_id, now.timestamp()),
+                (until, token, _now_iso(), session_id, now.timestamp()),
             )
             return cursor.rowcount == 1
 
-        return await self._run(work)
+        return token if await self._run(work) else None
 
-    async def release_lease(self, session_id: str) -> None:
+    async def release_lease(self, session_id: str, *, token: str) -> None:
+        """只释放令牌对得上的那条租约。
+
+        令牌对不上时静默返回 —— 那不是错误，是「租约已经过期并被别人接管了」。
+
+        ⚠️ 这个 `AND lease_token = ?` 就是整个所有权制度本身，别去掉。
+        去掉以后的行为是：一个超过 TTL 的慢操作跑完时，会把**已经换手给别人**
+        的租约放掉，于是第三个请求也能同时进来。见 `base.py` 里
+        `acquire_lease` 的说明和 M6a 的 roadmap 记录。
+        """
+
         def work(conn: sqlite3.Connection) -> None:
             conn.execute(
-                "UPDATE sessions SET lease_until = NULL WHERE id = ?", (session_id,)
+                "UPDATE sessions SET lease_until = NULL, lease_token = NULL "
+                "WHERE id = ? AND lease_token = ?",
+                (session_id, token),
             )
 
         await self._run(work)
 
     async def clear_all_leases(self) -> int:
+        """清空**所有**租约，不管属于谁。只在进程启动时调用。
+
+        这是唯一一个合理地绕过所有权的地方：它要处理的正是「上一个进程
+        被强杀，令牌再也回不来了」这种情况。
+        """
+
         def work(conn: sqlite3.Connection) -> int:
-            cursor = conn.execute("UPDATE sessions SET lease_until = NULL")
+            cursor = conn.execute(
+                "UPDATE sessions SET lease_until = NULL, lease_token = NULL"
+            )
             return cursor.rowcount
 
         return await self._run(work)

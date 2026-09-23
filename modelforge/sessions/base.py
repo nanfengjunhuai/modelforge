@@ -26,7 +26,7 @@ ADR-002 定下了「状态落盘 + 点击时重建」。但「状态」这个词
 
     ProviderEvent   五种    Provider 能产出的（providers/events.py）
     StreamEvent     七种    这条流上会出现的 = 上面五种 + ToolResult + DecisionRequest
-    LogEvent        七种    会被**写进日志**的 ← 本文件
+    LogEvent        八种    会被**写进日志**的 ← 本文件
 
 三者是不同的问题：前两个是「线上传什么」，第三个是「盘上存什么」。
 StreamEvent 里 `text_delta` 和 `tool_call_delta` 是碎片，**不落盘**——
@@ -58,6 +58,7 @@ from typing import Annotated, Any, Literal, Protocol, get_args, runtime_checkabl
 
 from pydantic import BaseModel, Field, TypeAdapter
 
+from modelforge.artifacts.base import ArtifactRef
 from modelforge.providers.base import Message
 from modelforge.providers.events import DecisionRequest, ToolResult
 
@@ -69,6 +70,7 @@ __all__ = [
     "LogDecisionAnswer",
     "LogDecisionRequest",
     "LogEvent",
+    "LogReport",
     "LogTool",
     "LogUsage",
     "LogUser",
@@ -221,6 +223,63 @@ class LogAborted(BaseModel):
     reason: str = ""
 
 
+class LogReport(BaseModel):
+    """一份生成的报告 —— 它由 REST 端点产出，**不是一次工具调用**。
+
+    ════════════════════════════════════════════════════════════════
+    为什么它需要一种自己的事件（M6a）
+    ════════════════════════════════════════════════════════════════
+    产物引用进日志只有一条路：`LogTool.result.artifacts`。而报告是用户点
+    「生成报告」之后由 `POST /sessions/{id}/report` 产出的 —— 那里**根本
+    没有工具调用**。不记这一条的话，报告在磁盘上、在界面上却看不见，
+    刷新一次就消失。
+
+    认真考虑过、并否决的替代方案：伪造一条 `LogTool` 把两个产物塞进去。
+    它确实零 schema 改动（`project_messages` 会忽略孤儿 tool 结果，有测试
+    钉着），代价是 —— 日志里多出一条「某工具跑过」的**假记录**，
+    而且前端 `fromSessionDetail` 的 `case 'tool'` 会照着它
+    **在对话流里画出一张幽灵工具卡片**。最后要在前端特判它，比加一个
+    联合成员还脏。见 ADR-016。
+
+    ════════════════════════════════════════════════════════════════
+    ⚠️ 加这一种事件的真实代价：旧版本回不去了
+    ════════════════════════════════════════════════════════════════
+    `parse_log_event` 遇到不认识的 kind **直接抛** —— 这是对的（一条读不出来
+    的记录是数据损坏，静默跳过会让历史悄悄缺一块）。而 `append` 每写一次都会
+    **重放整个会话**去刷新 title / status 缓存。两者合起来意味着：
+    只要日志里有一条 `report`，旧版本的代码在这个会话上**连发消息都发不出去**。
+
+    对单机自用工具来说这个代价可以接受，但它是真实存在的，所以写在这里，
+    而不是等哪天真的要回滚时才发现。
+    """
+
+    kind: Literal["report"] = "report"
+
+    title: str
+    """报告的标题。同时就是那两个产物的显示名（`<标题>.md` / `<标题>.report.json`）。"""
+
+    document: ArtifactRef
+    """给人看的那份 —— Markdown，可下载。"""
+
+    sidecar: ArtifactRef
+    """给程序看的那份 —— 报告的结构化块（`ReportDocument` 的 JSON）。
+
+    为什么和 `.md` 并排存一份，而不是只留 Markdown：应用内的视图需要知道
+    「这一段是模型写的、那一块是程序从日志里投影出来的」，而 Markdown 把
+    两者压成了同一种文本，那个区别就没了。这和 M5 让 `<名字>.png` 和
+    `<名字>.chart.json` 并排是同一个形状（ADR-012）：**可读的那份给人，
+    结构化的那份给程序**，同一个东西的两个视图。
+    """
+
+    provider: str = ""
+    model: str = ""
+    """这份报告是哪个模型写的。
+
+    报告的价值取决于它可不可信，而「谁写的」是可信度的一部分。
+    两个都留空表示当时没取到（不抛异常 —— 记账失败不该毁掉主产物）。
+    """
+
+
 # ══════════════════════════════════════════════════════ 判别联合
 
 
@@ -231,13 +290,18 @@ LogEvent = Annotated[
     | LogDecisionRequest
     | LogDecisionAnswer
     | LogUsage
-    | LogAborted,
+    | LogAborted
+    | LogReport,
     Field(discriminator="kind"),
 ]
-"""会被写进日志的七种记录。
+"""会被写进日志的八种记录。
 
 和 StreamEvent 一样用判别联合 —— 但要强调的是，**这两个联合的成员列表不同，
 而且是应该不同**：线上的碎片不落盘，落盘的用量不在线上。
+
+⚠️ 往这个联合里加成员是**跨语言的**改动：`web/src/lib/log-types.ts` 里有一份
+镜像，`tests/test_event_contract.py` 会比对两个 kind 集合，漏了会红。
+（这条是设计出来的：TS 那边少一个 case 不会编译报错，只能靠测试兜。）
 """
 
 # `get_args` 在 Annotated 外面那层返回 `(联合本身, FieldInfo)`，再对联合本身
@@ -248,7 +312,7 @@ _LOG_UNION = get_args(LogEvent)[0]
 LOG_EVENT_KINDS = frozenset(
     member.model_fields["kind"].default for member in get_args(_LOG_UNION)
 )
-"""七种 kind 的取值集合。
+"""八种 kind 的取值集合。
 
 给跨语言契约测试用：它会拿这个集合去比对 `web/src/lib/log-types.ts`。
 （TS 无法 import Python，所以只能这样土法比对 —— 见 tests/test_event_contract.py。）
@@ -319,15 +383,48 @@ class SessionStore(Protocol):
     # 用一个只在单进程内有效的锁去保护一个跨进程的状态，是把那个理由
     # 原样搬了回来。租约写在数据库里，多进程（甚至多机）都认。
 
-    async def acquire_lease(self, session_id: str, *, seconds: float) -> bool:
-        """尝试独占一个会话。已经被人占着（且租约未过期）时返回 False。
+    async def acquire_lease(self, session_id: str, *, seconds: float) -> str | None:
+        """尝试独占一个会话。成功返回**所有权令牌**，抢不到返回 None。
 
-        返回布尔而不是抛异常：抢不到锁是**正常的并发结果**，不是错误。
+        返回 None 而不是抛异常：抢不到锁是**正常的并发结果**，不是错误。
         抛异常会逼调用方写 try/except 去表达一个 if。
+
+        ════════════════════════════════════════════════════════════
+        ⚠️ 为什么是令牌，而不是布尔（M6a 改的）
+        ════════════════════════════════════════════════════════════
+        原来的签名返回 `bool`，配套的释放是「无条件把 lease_until 置空」。
+        它有一个**只在慢操作上才暴露**的漏洞：
+
+            t=0    报告生成抢到租约（TTL 180 秒）
+            t=180  租约过期 —— 数据库认为它已经空闲了
+            t=185  聊天流抢到租约（合法：确实没人占着了）
+            t=200  报告生成跑完，finally 里无条件释放 → **把聊天流的租约放了**
+            t=201  第三个请求也能进来 → 两条流同时写同一个会话
+
+        报告生成是 4 次模型调用，**必然**超过 180 秒，所以这个漏洞从「理论存在」
+        变成了「每次都用得到」。而单元测试里全是瞬时返回的假 Provider，
+        撞不上它 —— 又是一个「全绿但真实运行会炸」。
+
+        修法是把「我占着」变成一张**凭证**：抢到的那个协程拿到一个随机令牌，
+        释放时必须把它交回来，SQL 里带上 `AND lease_token = ?`。
+        令牌对不上 = 这条租约早就不是你的了，什么也不做。
         """
         ...
 
-    async def release_lease(self, session_id: str) -> None: ...
+    async def release_lease(self, session_id: str, *, token: str) -> None:
+        """释放租约 —— **只释放令牌对得上的那一条**。
+
+        ⚠️ `token` 是**必填的**，故意不给默认值。
+
+        给一个 `token=None` 的默认值意味着「省略它就无条件释放」，
+        也就是把上面那个漏洞原样留着，只等某个人忘了传参数。
+        必填参数能让 mypy 在**调用点**就抓住这个遗漏 —— 和
+        `run_agent_turn` 的 `recorder` 参数不给默认值是同一条理由。
+
+        令牌对不上时**静默地什么都不做**，不抛异常：那不是错误，
+        是「这条租约已经过期并被别人接管了」，属于正常的并发结果。
+        """
+        ...
 
     async def clear_all_leases(self) -> int:
         """清空所有租约，返回清掉的条数。**进程启动时必须调用。**

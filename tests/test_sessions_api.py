@@ -397,6 +397,6 @@ def hold_the_lease(session_id: str, *, seconds: float = 60) -> None:
 
     async def go() -> None:
         taken = await sessions_api.get_store().acquire_lease(session_id, seconds=seconds)
-        assert taken, "没能占住租约 —— 这个测试的前提就不成立了"
+        assert taken is not None, "没能占住租约 —— 这个测试的前提就不成立了"
 
     anyio.run(go)
