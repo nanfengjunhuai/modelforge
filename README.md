@@ -6,7 +6,7 @@
 但**每个关键决策点它会停下来问你**：怎么拆题、选哪个模型、参数怎么定。你拍板，它执行，全程可见。
 
 [![Python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org/)
-[![Next.js](https://img.shields.io/badge/Next.js-15-black)](https://nextjs.org/)
+[![Next.js](https://img.shields.io/badge/Next.js-16-black)](https://nextjs.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ---
@@ -66,19 +66,36 @@ cd web && npm install && cd ..
 cp .env.example .env
 ```
 
-（详细启动方式随开发进度补充）
+```bash
+# 后端（在项目根目录，:8000）
+.venv/Scripts/python -m uvicorn modelforge.main:app --reload --port 8000
+
+# 前端（另一个终端，:3000）
+cd web && npm run dev
+```
+
+然后打开 <http://localhost:3000/chat>。
+
+验证流式输出是真的在流（而不是攒完一起发）：
+
+```bash
+.venv/Scripts/python scripts/smoke_stream.py "用三句话解释什么是熵权法"
+```
 
 ## 开发路线
 
-| 阶段 | 内容 |
-|---|---|
-| M0 | 环境搭建、骨架跑通 |
-| M1 | Provider 抽象层、最小 Agent 循环 |
-| M2 | SSE 流式协议、前端首个界面 |
-| M3 | 工具调用、沙箱执行 |
-| M4 | HITL 中断 / 恢复、状态持久化 |
-| M5 | 完整工作台 UI、交互图表 |
-| M6 | 报告生成、部署、文档 |
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| M0 | 环境搭建、骨架跑通 | ✅ |
+| — | 设计系统（UI 与图表共用一套色彩体系） | ✅ |
+| M1 | Provider 抽象层 | ✅ |
+| M2 | SSE 流式协议、流式对话界面 | ✅ |
+| M3 | 工具调用、沙箱执行 | ⬅ 进行中 |
+| M4 | HITL 中断 / 恢复、状态持久化 | |
+| M5 | 完整工作台 UI、交互图表 | |
+| M6 | 报告生成、部署、文档 | |
+
+架构决策记录（每个决策的「为什么」）在 [`docs/roadmap.md`](docs/roadmap.md)。
 
 ## 许可证
 
