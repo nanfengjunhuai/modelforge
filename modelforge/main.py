@@ -21,7 +21,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from modelforge import __version__
-from modelforge.api import chat, health
+from modelforge.api import chat, health, sessions
 from modelforge.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -37,9 +37,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     开发时用 `--reload` 会频繁重启，不关的话未释放的连接会越积越多，
     最后在日志里看到一堆 "Unclosed client session" 之类的告警。
+
+    启动时还多做一件事：**清空所有会话租约**。见下面那段注释。
     """
     logger.info("ModelForge %s 启动中……", __version__)
+
+    # ── 清理上一次进程留下的租约 ──────────────────────────────
+    #
+    # 会话靠数据库租约做并发保护（api/sessions.py）。正常情况下流结束时
+    # 自己会还，但**进程被强杀**（Ctrl+C 来不及、任务管理器结束进程、
+    # --reload 把旧进程干掉）时来不及还，那条租约就会一直挂到 TTL 过期。
+    #
+    # 开发期这个问题尤其刺眼：改一行代码触发热重载 → 正在跑的会话带着租约
+    # 被掐死 → 用户刷新页面，拿到一个莫名其妙的 409，而且要等三分钟。
+    #
+    # 进程启动时清一遍是安全的：**这个进程刚刚开始，它不可能持有任何租约。**
+    # 所以这一行清掉的必然是「死人的租约」。
+    try:
+        cleared = await sessions.get_store().clear_all_leases()
+        if cleared:
+            logger.info("已清空 %d 条上次遗留的会话租约", cleared)
+    except Exception:
+        # 数据库还没建（第一次启动）、或者文件权限有问题……
+        # 这不该阻止服务起来：租约本来就有 TTL 兜底。
+        logger.warning("清空会话租约失败（不影响启动）", exc_info=True)
+
     yield
+
     await chat.close_providers()
     logger.info("ModelForge 已关闭，连接池已释放")
 
@@ -92,6 +116,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router, prefix="/api")
     app.include_router(chat.router, prefix="/api")
+    app.include_router(sessions.router, prefix="/api")
 
     logger.info(
         "ModelForge %s 已装配，默认模型 provider: %s", __version__, settings.default_provider

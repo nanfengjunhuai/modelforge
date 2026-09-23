@@ -28,6 +28,7 @@ from modelforge.providers.events import (
     ToolCallDelta,
     Usage,
 )
+from tests import helpers
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,16 @@ class _FakeProvider:
         self.closed = False
 
     async def stream(self, messages: list[dict[str, Any]], **kwargs: Any):
-        self.seen_messages = messages
+        # ⚠️ 必须**快照**，不能直接存引用。
+        #
+        # Agent 循环会把传进去的那个列表**就地扩展**（每轮的工具调用和结果
+        # 都要写回历史，模型下一轮才看得到）。存引用的话，测试事后读到的是
+        # 「后来又变了」的内容。
+        #
+        # M4 之前循环只在工具轮扩展它，所以这个替身一直是「对」的 ——
+        # 直到 M4 让**每一轮**都扩展它才暴露：一个普通回答的测试突然发现
+        # 消息多了一条。这类 bug 最难的地方在于**它长得像是被测代码的错**。
+        self.seen_messages = [dict(m) for m in messages]
         self.seen_kwargs = kwargs
         for event in self._events:
             yield event
@@ -81,16 +91,8 @@ class _ExplodingProvider:
 # ══════════════════════════════════════════════════════ 夹具
 
 
-@pytest.fixture(autouse=True)
-def _clear_provider_cache():
-    """每个测试前后都清空 Provider 缓存。
-
-    chat.py 用的是**进程级**缓存，测试之间不清理的话，
-    上一个测试塞进去的假 Provider 会泄漏到下一个测试里。
-    """
-    chat._providers.clear()
-    yield
-    chat._providers.clear()
+# Provider 缓存的清理在 conftest.py 里（autouse），
+# test_sessions_api.py 也需要同一份。
 
 
 @pytest.fixture
@@ -118,27 +120,9 @@ def _install(monkeypatch: pytest.MonkeyPatch, events: list[StreamEvent] | None =
 # ══════════════════════════════════════════════════════ 工具函数
 
 
-def parse_frames(body: str) -> list[tuple[str, dict[str, Any]]]:
-    """把 SSE 响应体拆成 (事件名, data) 列表。
-
-    这就是前端 `web/src/lib/sse.ts` 里那个解析器的 Python 版。
-    两边独立实现同一套解析，正好互相验证 ——
-    如果哪天有人只改了单边的格式假设，这里的断言会先炸。
-    """
-    frames: list[tuple[str, dict[str, Any]]] = []
-    for block in body.split("\n\n"):
-        if not block.strip():
-            continue
-        name = "message"
-        data: str | None = None
-        for line in block.split("\n"):
-            if line.startswith("event: "):
-                name = line[len("event: ") :]
-            elif line.startswith("data: "):
-                data = line[len("data: ") :]
-        assert data is not None, f"帧里没有 data 行: {block!r}"
-        frames.append((name, json.loads(data)))
-    return frames
+# 帧解析器在 helpers.py 里 —— test_sessions_api.py 也要用同一份。
+# 同一个语言里放两份实现没有「互相验证」的价值，只会各自漂移。
+parse_frames = helpers.frames_of
 
 
 def post(client: TestClient, **payload: Any):

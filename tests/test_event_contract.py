@@ -29,6 +29,7 @@ from modelforge.providers.events import FinishReason, ProviderEvent, StreamEvent
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TS_TYPES = PROJECT_ROOT / "web" / "src" / "lib" / "stream-types.ts"
+TS_LOG_TYPES = PROJECT_ROOT / "web" / "src" / "lib" / "log-types.ts"
 
 
 # ══════════════════════════════════════════════════════ Python 侧
@@ -122,6 +123,95 @@ def test_finish_reasons_match_between_python_and_typescript(ts_source: str):
     )
 
 
+# ══════════════════════════════════════════════════════ 事件日志的契约
+#
+# M4 新增的一整层。在它之前，这份文件**只管流事件** ——
+# 而日志事件有七个 kind、各有一组字段，跨语言的手动同步和流事件一样脆弱：
+# 把 `call_id` 写成 `callId` 不会有任何东西变红，只会在某个刷新之后
+# 静默地少显示一张决策卡片。
+
+
+@pytest.fixture(scope="module")
+def ts_log_source() -> str:
+    assert TS_LOG_TYPES.exists(), (
+        f"找不到 {TS_LOG_TYPES}。这个测试要同时看到前后端两个文件，"
+        "确认你在完整的仓库里跑它。"
+    )
+    return TS_LOG_TYPES.read_text(encoding="utf-8")
+
+
+def _python_log_fields() -> dict[str, set[str]]:
+    """{kind 取值: 该类字段名集合}。"""
+    from modelforge.sessions.base import LogEvent
+
+    return {
+        member.model_fields["kind"].default: set(member.model_fields)  # type: ignore[attr-defined]
+        for member in _union_members(LogEvent)
+    }
+
+
+def _ts_log_fields(source: str) -> dict[str, set[str]]:
+    """从 log-types.ts 里抠出「每种日志事件的 kind 和顶层字段名」。
+
+    只认那些**含 `kind` 字段**的 `export type Xxx = { ... }` 块 ——
+    `LoggedMessage` / `LoggedToolCall` 同样是对象类型，但它们是日志事件
+    的**零件**，不是日志事件本身。
+    """
+    result: dict[str, set[str]] = {}
+    for match in re.finditer(r"export type (\w+) = \{(.*?)\n\}", source, re.S):
+        body = match.group(2)
+        kind = re.search(r"^\s*kind:\s*'([a-z_]+)'", body, re.M)
+        if not kind:
+            continue
+        # `?` 是可选字段（TS 里 `note?: string`）。日志事件的顶层字段
+        # 目前都是必填，但这个正则要能容忍注释里带冒号的行 ——
+        # 所以锚在行首、且要求字段名是合法标识符。
+        result[kind.group(1)] = set(re.findall(r"^\s*(\w+)\??:", body, re.M))
+    return result
+
+
+def test_log_event_kinds_match_between_python_and_typescript(ts_log_source: str):
+    """两边认识的日志事件 kind 必须一模一样。
+
+    这条红了通常意味着：后端加了一种日志记录但没改前端 ——
+    于是那种记录在前端的 `switch` 里静默落进 default 分支，永远不显示。
+    """
+    from modelforge.sessions.base import LOG_EVENT_KINDS
+
+    ts_side = _ts_log_fields(ts_log_source)
+    assert set(ts_side) == set(LOG_EVENT_KINDS), (
+        f"\n后端有、前端没有：{sorted(set(LOG_EVENT_KINDS) - set(ts_side))}"
+        f"\n前端有、后端没有：{sorted(set(ts_side) - set(LOG_EVENT_KINDS))}"
+        f"\n（前端文件：{TS_LOG_TYPES}）"
+    )
+
+
+def test_log_event_fields_match_between_python_and_typescript(ts_log_source: str):
+    """**每种日志事件的字段名也要一致。**
+
+    为什么 kind 对上了还不够？因为最容易犯的错不是「少了一种事件」，
+    而是「字段名对不上」：后端 `call_id`、前端 `callId`。
+    那种情况下 kind 检查全绿，而前端拿到的是一个 `undefined` ——
+    决策卡片提交时带上 `callId: undefined`，后端返回 409，
+    用户看到「页面上的卡片过期了，刷新一下」，刷新之后还是不行。
+
+    这类 bug 的定位成本极高，而拦住它只需要十几行正则。
+    """
+    python_side = _python_log_fields()
+    ts_side = _ts_log_fields(ts_log_source)
+
+    mismatches = {
+        kind: (python_side.get(kind, set()), fields)
+        for kind, fields in ts_side.items()
+        if python_side.get(kind, set()) != fields
+    }
+    assert not mismatches, "\n".join(
+        f"{kind}: 后端 {sorted(py)} vs 前端 {sorted(ts)}"
+        for kind, (py, ts) in mismatches.items()
+    )
+    assert set(python_side) == set(ts_side), "kind 集合对不上（见上一条测试）"
+
+
 def test_provider_events_are_a_strict_subset_of_stream_events():
     """Provider 能产出的事件，必须是整条流上事件集合的**真子集**。
 
@@ -135,23 +225,111 @@ def test_provider_events_are_a_strict_subset_of_stream_events():
     stream_side = _python_event_types(StreamEvent)
 
     assert provider_side < stream_side, "真子集关系被破坏了"
-    assert stream_side - provider_side == {"tool_result"}
+    # 多出来的这两个，**只有 Agent 循环能造**：
+    #   tool_result      —— 沙箱跑完代码之后
+    #   decision_request —— 循环决定该停下来问用户了
+    # 每加一个都会让这里变红，逼着人想清楚「Provider 到底有没有能力产出它」。
+    assert stream_side - provider_side == {"tool_result", "decision_request"}
 
 
-def test_every_event_type_is_actually_reachable():
-    """每个事件类型都得有人真的产出它 —— 不能有「定义了但永远不发」的类型。
+async def test_every_stream_event_type_can_actually_be_produced():
+    """每个事件类型都得有人**真的**产出它 —— 不能有「定义了但永远不发」的类型。
 
-    死类型不只是浪费，它会误导读者：看到 ToolResult 的定义会以为
-    「某个 Provider 可能会发」或者「某处应该会发」，然后去找半天。
+    死类型不只是浪费，它会误导读者：看到某个定义会以为「某处应该会发它」，
+    然后去找半天。
+
+    ⚠️ 这条测试曾经是个**假测试**：它只断言了三个函数 `callable`，
+    而没有真的跑它们。上面那段注释当时甚至写着「这三个模块合起来覆盖了
+    全部六种」—— 覆盖是覆盖了，但**测试一个字都没验证**。
+    M4 新增 `decision_request` 时它没有守住任何东西，于是顺手改成真的。
+
+    做法：把循环用剧本驱动一遍，收集所有**实际出现过**的事件类型，
+    和 `StreamEvent` 的定义集合比对。多一个少一个都会红。
     """
     from modelforge.agents.loop import run_agent_turn
-    from modelforge.providers.openai_compat import chunk_to_events
-    from modelforge.sandbox.tools import dispatch
+    from modelforge.providers.events import (
+        ErrorEvent,
+        Finish,
+        TextDelta,
+        ToolCallDelta,
+        Usage,
+    )
 
-    # 这三个模块合起来覆盖了全部六种：
-    #   chunk_to_events → text_delta / tool_call_delta / usage / finish / error
-    #   dispatch        → （返回 ToolResult，由 loop 转成事件）
-    #   run_agent_turn  → 转发上面全部 + 自己产出 tool_result
-    assert callable(chunk_to_events)
-    assert callable(dispatch)
-    assert callable(run_agent_turn)
+    class _Scripted:
+        """按轮次吐事件的假 Provider。"""
+
+        name = "scripted-for-contract"
+
+        def __init__(self, rounds: list[list[object]]) -> None:
+            self._rounds = rounds
+            self._index = 0
+
+        async def stream(self, messages: object, **kwargs: object):
+            events = self._rounds[self._index]
+            self._index += 1
+            for event in events:
+                yield event
+
+        async def aclose(self) -> None:
+            pass
+
+    class _Executor:
+        name = "fake"
+
+        async def run(self, code: str, *, timeout: float | None = None):
+            from modelforge.sandbox.base import ExecutionResult
+
+            return ExecutionResult(stdout="ok\n", exit_code=0)
+
+    class _Recorder:
+        async def assistant_round(self, message: object) -> None: ...
+        async def tool_result(self, message: object, result: object) -> None: ...
+        async def usage(self, **kwargs: object) -> None: ...
+        async def decision_requested(self, request: object) -> None: ...
+
+    def ask_arguments() -> str:
+        import json
+
+        return json.dumps({"question": "选哪个？", "options": ["A", "B"]}, ensure_ascii=False)
+
+    # 一个把七种类型全踩一遍的剧本：
+    #   第 1 轮：调 run_python → tool_call_delta + tool_result
+    #   第 2 轮：调 ask_user   → decision_request + finish(awaiting_user)
+    #   第 3 轮：模型侧出错     → error
+    scripted = _Scripted(
+        [
+            [
+                TextDelta(text="先算一下。"),
+                ToolCallDelta(
+                    index=0, id="c1", name="run_python",
+                    arguments_delta='{"code": "print(1)"}',
+                ),
+                Usage(prompt_tokens=5, completion_tokens=1),
+                Finish(reason="tool_calls"),  # type: ignore[arg-type]
+            ],
+            [
+                ToolCallDelta(index=0, id="c2", name="ask_user", arguments_delta=ask_arguments()),
+                Finish(reason="tool_calls"),  # type: ignore[arg-type]
+            ],
+        ]
+    )
+    # 第三轮单独跑一次（出错的那条剧本），因为 await_user 会让循环提前结束
+    exploding = _Scripted([[ErrorEvent(message="网络断了"), Finish(reason="error")]])  # type: ignore[arg-type]
+
+    from modelforge.sandbox.tools import ASK_USER_SPEC, TOOL_SPECS
+
+    seen: set[str] = set()
+    for provider in (scripted, exploding):
+        async for event in run_agent_turn(
+            provider,  # type: ignore[arg-type]
+            [],
+            executor=_Executor(),  # type: ignore[arg-type]
+            recorder=_Recorder(),  # type: ignore[arg-type]
+            tools=[*TOOL_SPECS, ASK_USER_SPEC],
+        ):
+            seen.add(event.type)
+
+    assert seen == _python_event_types(StreamEvent), (
+        f"\n定义了但没有任何人产出：{sorted(_python_event_types(StreamEvent) - seen)}"
+        f"\n产出了但没定义：{sorted(seen - _python_event_types(StreamEvent))}"
+    )

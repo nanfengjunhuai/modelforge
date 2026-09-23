@@ -189,14 +189,11 @@ async function* readFrames(body: ReadableStream<Uint8Array>): AsyncGenerator<Raw
 // ══════════════════════════════════════════════════════ 对外接口
 
 /**
- * 发起一次流式对话，逐个 yield 类型化的事件。
+ * 发一个 POST 并把响应当作 SSE 流读回来 —— 所有流式端点的公共部分。
  *
- * 用法（在 `async` 函数里）：
- *
- *     const controller = new AbortController()
- *     for await (const event of streamChat(messages, { signal: controller.signal })) {
- *       if (event.type === 'text_delta') setText((t) => t + event.text)
- *     }
+ * 抽出来是因为 M4 之后有**四个**流式端点（无状态的 /chat/stream，
+ * 以及会话的 messages / decisions / resume）。它们要发的请求体不同，
+ * 但「怎么读回来」完全一样，而那部分正是最容易写错的地方。
  *
  * 错误分两层，两边都要处理（后端 chat.py 里有详细解释）：
  *
@@ -205,28 +202,24 @@ async function* readFrames(body: ReadableStream<Uint8Array>): AsyncGenerator<Raw
  *   · **流开始之后** 失败 → 不抛异常，而是 yield 一条 `{ type: 'error' }` 事件。
  *     因为 HTTP 头早就发出去了，改不了状态码，只能在流里面报。
  */
-export async function* streamChat(
-  messages: ChatMessage[],
-  options: StreamChatOptions = {},
+async function* postStream(
+  path: string,
+  body: unknown,
+  signal?: AbortSignal,
 ): AsyncGenerator<StreamEvent> {
-  const response = await fetch(`${API_BASE}/api/chat/stream`, {
+  const response = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    // 显式列出要发的字段，而不是把 options 整个展开 ——
-    // 免得以后加了前端专用的选项（比如 UI 开关）被顺手发给后端。
-    body: JSON.stringify({
-      messages,
-      provider: options.provider,
-      temperature: options.temperature,
-    }),
-    signal: options.signal,
+    body: JSON.stringify(body),
+    signal,
   })
 
   if (!response.ok) {
-    // 后端在流开始前的失败会带着一句人话放在 detail 里（见 chat.py 的 HTTPException）。
-    // 读出来拼进错误信息，比只报「400」有用得多。
-    const detail = await response.text()
-    throw new Error(`后端返回 ${response.status}：${detail.slice(0, 300)}`)
+    // 后端在流开始前的失败会带着一句人话放在 detail 里（见 sessions.py 的
+    // HTTPException）。读出来拼进错误信息，比只报「409」有用得多 ——
+    // 那些 409 的文案本身就是给用户看的（「还有一个问题在等你拍板」）。
+    const raw = await response.text()
+    throw new Error(describeHttpError(response.status, raw))
   }
 
   if (!response.body) {
@@ -247,4 +240,107 @@ export async function* streamChat(
     }
     yield parsed as StreamEvent
   }
+}
+
+/**
+ * 把 FastAPI 的错误响应变成一句人话。
+ *
+ * FastAPI 的错误体会是 `{"detail": "..."}`，而 `detail` 可能是字符串
+ * （我们抛的 HTTPException）也可能是**对象数组**（Pydantic 的校验错误）。
+ * 直接 `text.slice()` 显示出来的话，用户会看到一坨 JSON。
+ */
+function describeHttpError(status: number, raw: string): string {
+  const detail = raw.slice(0, 300)
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && 'detail' in parsed) {
+      const value = (parsed as { detail: unknown }).detail
+      if (typeof value === 'string') {
+        return value
+      }
+      if (Array.isArray(value)) {
+        // Pydantic 的校验错误：挑每条里的 msg 拼起来，够用了。
+        const messages = value
+          .map((item) =>
+            item && typeof item === 'object' && 'msg' in item
+              ? String((item as { msg: unknown }).msg)
+              : '',
+          )
+          .filter(Boolean)
+        if (messages.length) return messages.join('；')
+      }
+    }
+  } catch {
+    /* 不是 JSON —— 那就用原始文本 */
+  }
+  return `后端返回 ${status}：${detail}`
+}
+
+// ══════════════════════════════════════════════════════ 四个端点
+
+/**
+ * 无状态的流式对话 —— M2 留下的调试端点。
+ *
+ * 前端**已经不用它了**（M4 之后主路径是会话驱动的）。留着是因为它
+ * 在调试提示词时很方便：不建会话、不落盘，改一句 system prompt 就能试。
+ */
+export async function* streamChat(
+  messages: ChatMessage[],
+  options: StreamChatOptions = {},
+): AsyncGenerator<StreamEvent> {
+  yield* postStream(
+    '/api/chat/stream',
+    // 显式列出要发的字段，而不是把 options 整个展开 ——
+    // 免得以后加了前端专用的选项（比如 UI 开关）被顺手发给后端。
+    { messages, provider: options.provider, temperature: options.temperature },
+    options.signal,
+  )
+}
+
+/**
+ * 往会话里发一条用户消息，开一轮新的生成。
+ *
+ * ⚠️ 注意这里**只发这一条消息**，不像 M2/M3 那样把整个历史重发一遍。
+ * 历史在后端的事件日志里，它会自己投影出来 —— 这正是 M4 的全部意义：
+ * 状态归后端所有，所以刷新页面、换台机器、服务重启都不丢。
+ */
+export async function* streamSessionMessage(
+  sessionId: string,
+  content: string,
+  signal?: AbortSignal,
+): AsyncGenerator<StreamEvent> {
+  yield* postStream(`/api/sessions/${sessionId}/messages`, { content }, signal)
+}
+
+/** 提交一个决策点的答案，让 Agent 接着往下跑。 */
+export async function* streamDecision(
+  sessionId: string,
+  submission: { callId: string; choice: string; note?: string },
+  signal?: AbortSignal,
+): AsyncGenerator<StreamEvent> {
+  yield* postStream(
+    `/api/sessions/${sessionId}/decisions`,
+    {
+      // 后端要 snake_case（Python 那边是 `call_id`）——
+      // 跨语言的字段名映射就在这里做，不要让调用方去记。
+      call_id: submission.callId,
+      choice: submission.choice,
+      note: submission.note ?? '',
+    },
+    signal,
+  )
+}
+
+/**
+ * 按当前历史重开一条流，**不追加任何事件**。
+ *
+ * 用在「上一轮跑到一半断了」的时候（网络抖动、后端重启）。
+ * 因为既然一切都能从事件日志重建，重试就是免费的 ——
+ * 这是「状态落盘 + 重建」相对「进程内挂起一个 Future」的核心优势之一。
+ */
+export async function* streamResume(
+  sessionId: string,
+  signal?: AbortSignal,
+): AsyncGenerator<StreamEvent> {
+  yield* postStream(`/api/sessions/${sessionId}/resume`, undefined, signal)
 }

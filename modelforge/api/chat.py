@@ -55,10 +55,17 @@ from modelforge.providers.registry import get_provider
 from modelforge.sandbox.base import CodeExecutor
 from modelforge.sandbox.subprocess_exec import SubprocessExecutor
 from modelforge.sandbox.tools import TOOL_SPECS
+from modelforge.sessions.base import DiscardRecorder
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["close_providers", "format_sse", "get_executor", "router"]
+__all__ = [
+    "acquire_provider",
+    "close_providers",
+    "format_sse",
+    "get_executor",
+    "router",
+]
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -139,7 +146,7 @@ class ChatRequest(BaseModel):
 _providers: dict[str, ChatProvider] = {}
 
 
-def _acquire_provider(name: str | None) -> ChatProvider:
+def acquire_provider(name: str | None) -> ChatProvider:
     """按名字取 Provider，带进程级缓存。
 
     为什么必须缓存？因为 `AsyncOpenAI` 内部维护着一个 httpx **连接池**，
@@ -216,7 +223,7 @@ async def stream_chat(payload: ChatRequest, request: Request) -> StreamingRespon
     所以下面那个 `except Exception` **故意不拦它**，让它正常向上传播。
     """
     try:
-        provider = _acquire_provider(payload.provider)
+        provider = acquire_provider(payload.provider)
     except ValueError as exc:
         # 配置类错误（provider 名字写错 / API Key 没配）发生在流开始之前，
         # 可以正常用 HTTP 状态码表达，前端读 response.ok 就能拿到。
@@ -242,6 +249,10 @@ async def stream_chat(payload: ChatRequest, request: Request) -> StreamingRespon
                 provider,
                 messages,
                 executor=get_executor(),
+                # 无状态端点**不落盘**，显式传一个空的 recorder。
+                # 这个参数没有默认值，正是为了让「这条路径不持久化」这件事
+                # 在代码里看得见 —— 而不是靠一个 NoOp 默认值悄悄消失。
+                recorder=DiscardRecorder(),
                 tools=TOOL_SPECS if payload.tools else None,
                 temperature=payload.temperature,
                 max_tokens=payload.max_tokens,

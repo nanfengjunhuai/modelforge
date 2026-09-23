@@ -46,6 +46,7 @@ export type FinishReason =
   | 'content_filter' // 被内容安全策略拦截
   | 'error' // 异常终止，前面通常已经有一条 error 事件
   | 'max_rounds' // 工具调用轮数达到上限，Agent 循环主动收尾
+  | 'awaiting_user' // 停在决策点上等用户拍板：这条流结束，但对话没结束
 
 /** 模型吐出的一小段文本。产品体验的核心：它到了就立刻显示。 */
 export type TextDelta = {
@@ -126,6 +127,37 @@ export type ToolResultEvent = {
 }
 
 /**
+ * Agent 停在决策点上，把候选方案摆给用户（M4 新增）。
+ *
+ * ⚠️ 和 `ToolResultEvent` 一样，这是**唯一一种模型不会产出的事件** ——
+ * 它是 Agent 循环自己造的。后端为此把事件模型拆成了两个联合
+ * （`ProviderEvent` 五种 / `StreamEvent` 七种），就是为了让
+ * 「Provider 产不出这个」在类型层面成立。
+ *
+ * ════════════════════════════════════════════════════════════════
+ * 它本质上是一次「结果来自人」的工具调用
+ * ════════════════════════════════════════════════════════════════
+ * 后端那边 `ask_user` 和 `run_python` 是平级的工具，走同一条链。
+ * 差别只在结果从哪来。所以恢复的形态是：
+ *
+ *     用户点选项 → 后端把它 append 成一条事件
+ *     → 从事件日志重新投影出完整历史 → 重新跑一次 Agent 循环
+ *
+ * 前端这边要做的，是**在界面上给这个调用一个地方放答案**。
+ *
+ * 收到它之后流会以 `finish: 'awaiting_user'` 结束 —— 注意那是「这一轮结束了」，
+ * 不是「对话结束了」。输入框应该锁住，而不是显示成完成状态。
+ */
+export type DecisionRequestEvent = {
+  type: 'decision_request'
+  /** 和 assistant 那次 `ask_user` 的 tool_call id 一致。提交答案时要带回去。 */
+  call_id: string
+  question: string
+  options: string[]
+  allow_free_text: boolean
+}
+
+/**
  * 一条流里可能出现的所有事件。
  *
  * 用法：`switch (event.type)` —— TypeScript 会在这个联合上做穷尽性检查，
@@ -138,3 +170,4 @@ export type StreamEvent =
   | FinishEvent
   | ErrorEvent
   | ToolResultEvent
+  | DecisionRequestEvent

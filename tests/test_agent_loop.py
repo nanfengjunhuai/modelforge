@@ -19,6 +19,7 @@ import pytest
 from modelforge.agents.loop import run_agent_turn
 from modelforge.providers.base import Message
 from modelforge.providers.events import (
+    DecisionRequest,
     ErrorEvent,
     Finish,
     ProviderEvent,
@@ -29,7 +30,12 @@ from modelforge.providers.events import (
     Usage,
 )
 from modelforge.sandbox.base import ExecutionResult
-from modelforge.sandbox.tools import TOOL_SPECS
+from modelforge.sandbox.tools import ASK_USER_SPEC, TOOL_SPECS
+
+# 会话端点用的工具集：跑代码 + 问用户。
+# 单独列出来是因为**两个工具集刻意不同** —— 无状态的 /api/chat/stream
+# 只给 TOOL_SPECS，它没有地方能让用户回答 ask_user。
+SESSION_TOOLS = [*TOOL_SPECS, ASK_USER_SPEC]
 
 # ══════════════════════════════════════════════════════ 测试替身
 
@@ -77,6 +83,81 @@ class _FakeExecutor:
         return self._result
 
 
+class _Recorder:
+    """假的 recorder —— 把循环报告出来的「发生了什么」原样记下来。
+
+    M4 之后循环会往三个方向报告（跑完一轮 / 工具跑完 / 停在决策点），
+    而这些报告**就是落盘的内容**。用一个假的 recorder，就能离线断言
+    「该落的盘有没有落」，不需要真的起一个数据库或者拼 SQL。
+
+    ⚠️ **记下来的必须是快照。** 循环传进来的 `message` 是它自己那个
+    会被就地扩展的历史列表的一部分，存引用的话，测试事后看到的是
+    「后来又变了」的内容 —— `test_stream.py` 的 `_FakeProvider` 正是
+    栽在这上面（它 `self.seen_messages = messages` 存了引用，
+    M4 让循环每轮都扩展那个列表之后就静默地多出一条）。
+    """
+
+    def __init__(self) -> None:
+        self.assistant_rounds: list[Message] = []
+        self.tool_results: list[tuple[Message, ToolResult]] = []
+        self.decisions: list[DecisionRequest] = []
+        self.usages: list[dict[str, Any]] = []
+
+    def reset(self) -> None:
+        self.assistant_rounds.clear()
+        self.tool_results.clear()
+        self.decisions.clear()
+        self.usages.clear()
+
+    async def assistant_round(self, message: Message) -> None:
+        self.assistant_rounds.append(dict(message))
+
+    async def tool_result(self, message: Message, result: ToolResult) -> None:
+        self.tool_results.append((dict(message), result))
+
+    async def decision_requested(self, request: DecisionRequest) -> None:
+        self.decisions.append(request)
+
+    async def usage(
+        self, *, prompt_tokens: int, completion_tokens: int, finish_reason: str
+    ) -> None:
+        self.usages.append(
+            {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "finish_reason": finish_reason,
+            }
+        )
+
+
+# 模块级单例 + autouse 复位。
+#
+# 为什么不用「给每个测试函数加一个 `recorder` 夹具参数」那种更地道的写法？
+# 因为这个文件里二十多处调用 `run_agent_turn`，而其中只有三四个测试
+# 真的关心录制内容 —— 给二十个函数签名各加一个用不上的参数，
+# 换来的是满屏噪音，不是清晰度。
+_recorder = _Recorder()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_recorder():
+    """每个测试前后都清空录制内容，避免测试之间互相污染。"""
+    _recorder.reset()
+    yield
+    _recorder.reset()
+
+
+def _turn(provider, messages, **kwargs):
+    """`run_agent_turn` 的测试包装：自动塞一个 recorder 进去。
+
+    M4 之后 recorder 是必填参数（故意的，见 loop.py 的说明）。但在这个文件里，
+    二十多处调用中有二十处只关心「事件流对不对」，「有没有落盘」由
+    `_recorder` 那几条专门的测试和 `test_log_projection.py` 负责 ——
+    每处都手写一遍 `recorder=_recorder,` 是纯噪音，还会把行撑过长度限制。
+    """
+    return run_agent_turn(provider, messages, recorder=_recorder, **kwargs)
+
+
 def tool_round(
     *, code: str = "print(sum(range(1, 101)))", call_id: str = "call_1"
 ) -> list[ProviderEvent]:
@@ -117,7 +198,7 @@ async def test_plain_answer_runs_exactly_one_round():
     provider = _ScriptedProvider([text_round("熵权法是一种客观赋权方法。")])
     executor = _FakeExecutor()
 
-    events = await collect(run_agent_turn(provider, [], executor=executor, tools=TOOL_SPECS))
+    events = await collect(_turn(provider, [], executor=executor, tools=TOOL_SPECS))
 
     assert kinds(events) == ["text_delta", "usage", "finish"]
     assert events[-1].reason == "stop"  # type: ignore[union-attr]
@@ -134,7 +215,7 @@ async def test_no_tools_configured_skips_the_loop_entirely():
     provider = _ScriptedProvider([text_round("好的。")])
 
     events = await collect(
-        run_agent_turn(provider, [], executor=_FakeExecutor(), tools=None)
+        _turn(provider, [], executor=_FakeExecutor(), tools=None)
     )
 
     assert kinds(events) == ["text_delta", "usage", "finish"]
@@ -150,7 +231,7 @@ async def test_tool_call_is_executed_and_result_is_forwarded():
     provider = _ScriptedProvider([tool_round(), text_round("1 到 100 的和是 5050。")])
     executor = _FakeExecutor(ExecutionResult(stdout="5050\n", exit_code=0, duration_ms=7))
 
-    events = await collect(run_agent_turn(provider, [], executor=executor, tools=TOOL_SPECS))
+    events = await collect(_turn(provider, [], executor=executor, tools=TOOL_SPECS))
 
     assert kinds(events) == [
         "tool_call_delta", "tool_call_delta", "tool_call_delta",  # 碎片原样转发
@@ -183,7 +264,7 @@ async def test_finish_appears_exactly_once_and_last():
         ]
     )
 
-    events = await collect(run_agent_turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS))
+    events = await collect(_turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS))
 
     finishes = [e for e in events if e.type == "finish"]
     assert len(finishes) == 1, f"Finish 出现了 {len(finishes)} 次，应该恰好 1 次"
@@ -202,7 +283,7 @@ async def test_assistant_and_tool_messages_are_written_back_in_pairs():
     """
     provider = _ScriptedProvider([tool_round(call_id="call_xyz"), text_round("好的。")])
 
-    await collect(run_agent_turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS))
+    await collect(_turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS))
 
     # 第二次调用时，历史里应该已经有了一对完整的消息
     second_round_messages = provider.seen_messages[1]
@@ -232,7 +313,7 @@ async def test_tool_output_is_formatted_for_the_model():
         )
     )
 
-    await collect(run_agent_turn(provider, [], executor=executor, tools=TOOL_SPECS))
+    await collect(_turn(provider, [], executor=executor, tools=TOOL_SPECS))
 
     content = provider.seen_messages[1][1]["content"]
     assert "均值: 3.5" in content
@@ -246,7 +327,7 @@ async def test_empty_output_tells_the_model_to_print():
     provider = _ScriptedProvider([tool_round(), text_round("好。")])
     executor = _FakeExecutor(ExecutionResult(stdout="", stderr="", exit_code=0))
 
-    await collect(run_agent_turn(provider, [], executor=executor, tools=TOOL_SPECS))
+    await collect(_turn(provider, [], executor=executor, tools=TOOL_SPECS))
 
     assert "print()" in provider.seen_messages[1][1]["content"]
 
@@ -265,7 +346,7 @@ async def test_bad_json_arguments_become_a_failed_result_not_a_crash():
     provider = _ScriptedProvider([truncated, text_round("抱歉，我重新写一下。")])
     executor = _FakeExecutor()
 
-    events = await collect(run_agent_turn(provider, [], executor=executor, tools=TOOL_SPECS))
+    events = await collect(_turn(provider, [], executor=executor, tools=TOOL_SPECS))
 
     result = next(e for e in events if e.type == "tool_result")
     assert isinstance(result, ToolResult)
@@ -287,7 +368,7 @@ async def test_truncated_arguments_are_sanitized_before_writing_back():
     ]
     provider = _ScriptedProvider([truncated, text_round("重来。")])
 
-    await collect(run_agent_turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS))
+    await collect(_turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS))
 
     sent = provider.seen_messages[1][0]["tool_calls"][0]["function"]["arguments"]
     assert json.loads(sent) == {}, "坏参数应当被替换成合法的空对象"
@@ -301,7 +382,7 @@ async def test_unknown_tool_name_is_reported_to_the_model():
     ]
     provider = _ScriptedProvider([hallucinated, text_round("抱歉，我用错工具了。")])
 
-    events = await collect(run_agent_turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS))
+    events = await collect(_turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS))
 
     result = next(e for e in events if e.type == "tool_result")
     assert not result.ok  # type: ignore[union-attr]
@@ -324,7 +405,7 @@ async def test_provider_error_ends_the_turn_cleanly():
         ]
     )
 
-    events = await collect(run_agent_turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS))
+    events = await collect(_turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS))
 
     assert kinds(events) == ["text_delta", "error", "finish"]
     assert events[-1].reason == "error"  # type: ignore[union-attr]
@@ -348,7 +429,7 @@ async def test_max_rounds_stops_and_asks_one_final_time_without_tools():
     )
 
     events = await collect(
-        run_agent_turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS, max_rounds=2)
+        _turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS, max_rounds=2)
     )
 
     # 一共调了 3 次模型：2 次带工具 + 1 次收尾
@@ -381,7 +462,7 @@ async def test_max_rounds_is_reported_when_the_model_still_wants_tools():
     )
 
     events = await collect(
-        run_agent_turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS, max_rounds=2)
+        _turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS, max_rounds=2)
     )
 
     assert events[-1].type == "finish"
@@ -402,7 +483,7 @@ async def test_parallel_tool_calls_are_all_executed():
     provider = _ScriptedProvider([parallel, text_round("两个都跑完了。")])
     executor = _FakeExecutor()
 
-    events = await collect(run_agent_turn(provider, [], executor=executor, tools=TOOL_SPECS))
+    events = await collect(_turn(provider, [], executor=executor, tools=TOOL_SPECS))
 
     assert kinds(events).count("tool_result") == 2
     assert executor.seen_code == ["print(1)", "print(2)"]
@@ -423,16 +504,20 @@ async def test_messages_list_is_extended_in_place():
     provider = _ScriptedProvider([tool_round(), text_round("好。")])
     messages: list[Message] = [{"role": "user", "content": "帮我算 1 到 100 的和"}]
 
-    await collect(run_agent_turn(provider, messages, executor=_FakeExecutor(), tools=TOOL_SPECS))
+    await collect(_turn(provider, messages, executor=_FakeExecutor(), tools=TOOL_SPECS))
 
-    assert [m["role"] for m in messages] == ["user", "assistant", "tool"]
+    # 末尾那条 assistant 是 M4 加上去的：**最后那一轮也要写回历史**。
+    # M4 之前这里只有三条 —— 模型那句「好。」不在里面，
+    # 而它正是「刷新页面之后凭空消失的那句话」。
+    assert [m["role"] for m in messages] == ["user", "assistant", "tool", "assistant"]
+    assert messages[-1]["content"] == "好。"
 
 
 async def test_temperature_and_max_tokens_are_forwarded_every_round():
     provider = _ScriptedProvider([tool_round(), text_round("好。")])
 
     await collect(
-        run_agent_turn(
+        _turn(
             provider,
             [],
             executor=_FakeExecutor(),
@@ -455,7 +540,251 @@ async def test_non_tool_finish_reasons_end_the_turn_immediately(reason: str):
     """
     provider = _ScriptedProvider([text_round("半句话", reason=reason)])
 
-    events = await collect(run_agent_turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS))
+    events = await collect(_turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS))
 
     assert len(provider.seen_messages) == 1
     assert events[-1].reason == reason  # type: ignore[union-attr]
+
+
+# ══════════════════════════════════════════════════════ M4：落盘
+
+
+async def test_every_round_is_recorded_including_the_final_one():
+    """**M4 最重要的一条回归测试。**
+
+    M4 之前，循环只在「这一轮要调工具」的分支里把 assistant 消息写进历史，
+    最后那一轮（模型说完话就结束）**从来不落盘**。因为 M2/M3 的前端每次
+    都把全量历史重发一遍，这个 bug 完全看不出来 —— 但 M4 的历史是从
+    事件日志投影出来的，于是：
+
+        用户：帮我算 1 到 100 的和
+        蒟蒻：5050                          ← 这句话没被存下来
+        用户：那乘 2 呢？                    → 模型看到「我调了个工具，然后用户又问了新问题」
+        刷新页面 → 刚才那句回答凭空消失
+
+    而「刷新不丢」正是 M4 唯一的验收标准。
+
+    断言的是**不变式**（N 轮生成 → N 次录制），而不是「某个出口写了没有」——
+    正因为当初是「在三个出口各写一次」，才会漏掉一个。现在写在了分支之前，
+    所以三个出口自动全覆盖，而这条测试能守住这个结构不被改回去。
+    """
+    provider = _ScriptedProvider([tool_round(), text_round("1 到 100 的和是 5050。")])
+
+    await collect(
+        _turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS)
+    )
+
+    # 两次模型生成 = 两条 assistant 记录。少一条就是上面那个 bug 回来了。
+    assert len(_recorder.assistant_rounds) == 2
+    assert _recorder.assistant_rounds[-1]["content"] == "1 到 100 的和是 5050。"
+    # 最后那条不该带 tool_calls 键 —— 空数组是非法消息
+    assert "tool_calls" not in _recorder.assistant_rounds[-1]
+    # 中间那条必须带（模型请求了工具）
+    assert _recorder.assistant_rounds[0]["tool_calls"][0]["id"] == "call_1"
+
+
+async def test_assistant_message_never_carries_an_empty_tool_calls_list():
+    """没有工具调用时**不能**输出 `"tool_calls": []` —— 那是非法消息。
+
+    协议要求这个字段要么不存在，要么是非空数组。这个分支 M4 才出现，
+    因为现在每轮都会构造这条消息了，包括模型只是说了一句话就结束的那一轮。
+    """
+    provider = _ScriptedProvider([text_round("就这些。")])
+
+    await collect(
+        _turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS)
+    )
+
+    assert "tool_calls" not in _recorder.assistant_rounds[0]
+
+
+async def test_tool_results_are_recorded_with_both_message_and_raw_result():
+    """工具结果落盘时要带上**两样**东西。
+
+        message  —— 渲染好、回填给模型的那段文本（冻结，给重放用）
+        result   —— 原始结构（stdout / stderr / 耗时 / 退出码，给界面回放用）
+
+    看起来冗余，但读者不同：模型读 message，界面读 result。
+    只存 result 的话，M5 每次改 `format_for_model` 的措辞，所有历史会话
+    「模型当时看到的内容」都会被追溯性改写 —— 日志就不再忠实了。
+    """
+    provider = _ScriptedProvider([tool_round(), text_round("好。")])
+    executor = _FakeExecutor(ExecutionResult(stdout="均值: 3.5\n", exit_code=0, duration_ms=9))
+
+    await collect(
+        _turn(provider, [], executor=executor, tools=TOOL_SPECS)
+    )
+
+    assert len(_recorder.tool_results) == 1
+    message, result = _recorder.tool_results[0]
+    assert message["tool_call_id"] == "call_1"
+    assert "均值: 3.5" in message["content"]  # 给模型的
+    assert result.stdout == "均值: 3.5\n"  # 给界面的
+    assert result.duration_ms == 9
+
+
+async def test_usage_is_recorded_once_per_round():
+    """用量也要落盘 —— 不记就永远丢了，M5 做成本核算时补不回来。"""
+    provider = _ScriptedProvider([tool_round(), text_round("好。")])
+
+    await collect(
+        _turn(provider, [], executor=_FakeExecutor(), tools=TOOL_SPECS)
+    )
+
+    assert len(_recorder.usages) == 2
+    assert _recorder.usages[-1]["finish_reason"] == "stop"
+    assert _recorder.usages[-1]["prompt_tokens"] == 10
+
+
+# ══════════════════════════════════════════════════════ M4：中断
+
+
+def ask_round(
+    *,
+    call_id: str = "call_ask",
+    question: str = "这一步用哪种赋权方法？",
+    options: tuple[str, ...] = ("熵权法（客观，但要求数据完整）", "AHP（能纳入主观判断）"),
+    allow_free_text: bool = True,
+) -> list[ProviderEvent]:
+    """构造一轮「模型请求 ask_user」的事件。"""
+    arguments = json.dumps(
+        {"question": question, "options": list(options), "allow_free_text": allow_free_text},
+        ensure_ascii=False,
+    )
+    return [
+        ToolCallDelta(index=0, id=call_id, name="ask_user", arguments_delta=arguments),
+        Finish(reason="tool_calls"),
+    ]
+
+
+async def test_ask_user_ends_the_stream_with_awaiting_user():
+    """**HITL 的核心路径。**
+
+    模型调用 ask_user 时：发一条 decision_request、发一个
+    Finish(reason="awaiting_user")、然后**结束这条流**。
+
+    注意它不是「挂起等用户答完再继续」——那种做法进程一重启就没了
+    （ADR-002 拒绝它）。这里是如实记录一个「还没有结果的工具调用」，
+    结束本轮；用户答完后从落盘的状态重建，重新跑一次循环。
+    """
+    provider = _ScriptedProvider([ask_round()])
+
+    events = await collect(
+        _turn(provider, [], executor=_FakeExecutor(), tools=SESSION_TOOLS)
+    )
+
+    assert kinds(events) == ["tool_call_delta", "decision_request", "finish"]
+    assert events[-1].reason == "awaiting_user"  # type: ignore[union-attr]
+
+    decision = events[-2]
+    assert isinstance(decision, DecisionRequest)
+    assert decision.call_id == "call_ask"
+    assert decision.question == "这一步用哪种赋权方法？"
+    assert decision.options[0].startswith("熵权法")
+
+    # 同一件事也要落在日志里（前面的事件流是给前端的，recorder 是给盘的）
+    assert len(_recorder.decisions) == 1
+    assert _recorder.decisions[0].call_id == "call_ask"
+    # 这一轮的 assistant 消息依然要落盘 —— 它是恢复时重建上下文的依据
+    assert len(_recorder.assistant_rounds) == 1
+    assert _recorder.assistant_rounds[0]["tool_calls"][0]["function"]["name"] == "ask_user"
+
+
+async def test_ask_user_does_not_reach_the_sandbox():
+    """ask_user 不该被当成一个「要执行的工具」送进沙箱。
+
+    dispatch 里给它注册了一个**显式失败**的 handler（而不是让它 KeyError），
+    但正常情况下循环会在派发之前就拦住它 —— 这条测试守的是「循环真的拦住了」。
+    """
+    provider = _ScriptedProvider([ask_round()])
+    executor = _FakeExecutor()
+
+    await collect(
+        _turn(provider, [], executor=executor, tools=SESSION_TOOLS)
+    )
+
+    assert executor.seen_code == []
+    assert _recorder.tool_results == []
+
+
+async def test_executable_tools_run_before_the_interrupt():
+    """同一轮里既有 run_python 又有 ask_user 时，**先跑完代码再中断**。
+
+    为什么要这样排，而不是「遇到 ask_user 就停，后面的标记成已取消」？
+    因为那些取消记录会被 `format_for_model` 渲染成
+    「【沙箱未能执行代码】这不是你的代码的问题」—— 一句彻头彻尾的假话，
+    会把模型引向完全错误的方向。
+
+    语义上也更对：模型**并行**发起的调用本来就互不依赖，
+    否则它就该分两轮发了。
+
+    这个场景不是假想的：模型一次返回多个工具调用很常见。
+    而如果处理错了，投影出来的历史会有一个「有 tool_calls 却没有结果」的
+    assistant 消息 —— 下一次请求 100% 被服务端拒绝。
+    """
+    parallel = [
+        ToolCallDelta(
+            index=0, id="call_ask", name="ask_user",
+            arguments_delta=json.dumps(
+                {"question": "要不要继续？", "options": ["继续", "停"]}, ensure_ascii=False
+            ),
+        ),
+        ToolCallDelta(
+            index=1, id="call_run", name="run_python",
+            arguments_delta='{"code": "print(42)"}',
+        ),
+        Finish(reason="tool_calls"),
+    ]
+    provider = _ScriptedProvider([parallel])
+    executor = _FakeExecutor()
+
+    events = await collect(
+        _turn(provider, [], executor=executor, tools=SESSION_TOOLS)
+    )
+
+    # 代码真的跑了，结果也在流里
+    assert executor.seen_code == ["print(42)"]
+    assert [e.type for e in events].count("tool_result") == 1
+    # 然后才中断
+    assert events[-1].reason == "awaiting_user"  # type: ignore[union-attr]
+    assert _recorder.tool_results[0][0]["tool_call_id"] == "call_run"
+
+
+async def test_bad_ask_user_arguments_are_reported_not_interrupted():
+    """ask_user 参数写歪时，回填一条失败结果让模型自己修 —— **不要中断**。
+
+    这和 run_python 的参数写歪是同一类错误：模型能自己修。
+    停下来去问一个连问题都没成型的东西，对用户是纯打扰。
+    """
+    broken = [
+        ToolCallDelta(index=0, id="call_ask", name="ask_user", arguments_delta='{"question": '),
+        Finish(reason="tool_calls"),
+    ]
+    provider = _ScriptedProvider([broken, text_round("抱歉，我重新问。")])
+
+    events = await collect(
+        _turn(provider, [], executor=_FakeExecutor(), tools=SESSION_TOOLS)
+    )
+
+    result = next(e for e in events if e.type == "tool_result")
+    assert not result.ok  # type: ignore[union-attr]
+    assert "JSON" in (result.error or "")  # type: ignore[union-attr]
+    # 关键：**没有中断**，而是跑到了第二轮让模型改
+    assert len(provider.seen_messages) == 2
+    assert events[-1].reason == "stop"  # type: ignore[union-attr]
+    assert _recorder.decisions == []
+
+
+async def test_ask_user_is_not_offered_by_the_stateless_toolset():
+    """无状态端点**不能**拿到 ask_user。
+
+    `/api/chat/stream` 没有会话、没有事件日志、也没有任何地方能让用户
+    回答 —— 给了它 ask_user 只会得到一个死胡同：模型停下来问，
+    然后永远等不到答案，用户看到的是一个卡住的界面。
+
+    所以 `TOOL_SPECS` 里只有 run_python，会话端点显式地加一个 ASK_USER_SPEC。
+    这条测试守的就是「别有人图省事把它塞进 TOOL_SPECS」。
+    """
+    names = {spec["function"]["name"] for spec in TOOL_SPECS}
+    assert names == {"run_python"}
+    assert ASK_USER_SPEC["function"]["name"] not in names

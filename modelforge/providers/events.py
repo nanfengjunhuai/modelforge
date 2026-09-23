@@ -39,6 +39,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field
 
 __all__ = [
+    "DecisionRequest",
     "ErrorEvent",
     "Finish",
     "FinishReason",
@@ -59,7 +60,15 @@ __all__ = [
 #      —— 这条规则帮我抓出过一次真实疏漏：classify_finish_reason 原先声明返回 str，
 #         等于放弃了「只返回合法值」的保证，mypy 在赋值处报错才暴露出来；
 #   3. M2 生成 JSON Schema 时，前端能直接拿到这个枚举约束。
-FinishReason = Literal["stop", "tool_calls", "length", "content_filter", "error", "max_rounds"]
+FinishReason = Literal[
+    "stop",
+    "tool_calls",
+    "length",
+    "content_filter",
+    "error",
+    "max_rounds",
+    "awaiting_user",
+]
 
 
 # ══════════════════════════════════════════════════════ 五种事件
@@ -115,10 +124,14 @@ class Finish(BaseModel):
       · "content_filter"  被内容安全策略拦截
       · "error"           异常终止（此时前面通常已有一条 ErrorEvent）
       · "max_rounds"      工具调用轮数达到上限，Agent 循环主动收尾
+      · "awaiting_user"   M4 新增：停在决策点上等用户拍板，**这条流结束了但
+                          对话没有结束**。前端据此把输入框锁住、把决策卡片高亮。
 
-    最后这个值**只有 Agent 循环会产出**，Provider 永远不会。加它而不是复用
-    "length"，是因为两者对用户意味着不同的东西：length 是「回答被截断了」，
-    max_rounds 是「它算得太久了，我喊停的」。
+    后两个值**只有 Agent 循环会产出**，Provider 永远不会。加它们而不是复用
+    "length" / "stop"，是因为它们对用户意味着完全不同的东西：
+    length 是「回答被截断了」，max_rounds 是「它算得太久了，我喊停的」，
+    awaiting_user 是「它在等你」。
+
     顺带一提，加这个值的成本只有一行 —— 前端那份 TypeScript 镜像会因为
     `Record<FinishReason, string>` 漏了 key **编译报错**，逼着人补上。
     这就是当初把 FinishReason 抽成类型别名、而不是散写字面量的回报。
@@ -181,6 +194,52 @@ class ToolResult(BaseModel):
     error: str | None = None
 
 
+class DecisionRequest(BaseModel):
+    """Agent 停在决策点上，把候选方案摆给用户。M4 新增。
+
+    ════════════════════════════════════════════════════════════════
+    它的本质：一个「结果来自人」的工具调用
+    ════════════════════════════════════════════════════════════════
+    在 Agent 循环眼里，`ask_user` 和 `run_python` 是**平级的工具**，
+    走的是同一条链（声明 → 碎片累积 → 派发 → 回填 → 继续）。
+    唯一的差别是结果不在沙箱里。
+
+    所以中断在这里不是「挂起一个生成器」，而是：
+
+        如实记录一个还没有结果的工具调用 → 结束这条流
+        （用户答完之后，答案作为那个调用的结果补上，从落盘的状态重建再跑）
+
+    这正是 ADR-002 说的「状态落盘 + 点击时重建」的具体形态。
+
+    ════════════════════════════════════════════════════════════════
+    为什么 `options` 是字符串数组，而不是 {label, description} 对象
+    ════════════════════════════════════════════════════════════════
+    试过后者：模型开始把每个选项写成一整段小作文，卡片排版直接崩掉。
+    现在是「一句话选项 + 把取舍写在句子里」（工具描述里明确要求了这一点），
+    界面上一个选项一个按钮，长度可控。
+
+    将来真需要「标题 + 副标题」的结构，正确的做法是**在服务端把一句话
+    拆成主副标题**，而不是让模型自由发挥 —— 模型对「短一点」的理解
+    和排版需要差得很远。
+    """
+
+    type: Literal["decision_request"] = "decision_request"
+    call_id: str
+    """和 assistant 消息里那次 `ask_user` 的 `tool_calls[].id` 一致。
+    用户答完之后，答案以 `{"role":"tool","tool_call_id": call_id}` 的形式
+    回到对话历史里 —— 所以这个 id 是整条恢复链路的钥匙。"""
+
+    question: str
+    options: list[str]
+    allow_free_text: bool = True
+    """允不允许「以上都不对」地自由作答。
+
+    默认 True 是刻意的：数模题里用户的背景信息常常超出模型能枚举的范围
+    （「我们组已经买了某软件」「赛题里其实还暗示了另一层条件」）。
+    只给按钮会把这些信息挡在门外。
+    """
+
+
 # ══════════════════════════════════════════════════════ 判别联合
 
 # 判别联合：Pydantic 会按 `type` 字段自动派发到具体类型。
@@ -191,11 +250,13 @@ class ToolResult(BaseModel):
 # ------------------------------
 # 因为「Provider 能产出什么」和「这条流上会出现什么」是**两件事**：
 #
-#     Provider 能产出的   = 前五种              → ProviderEvent
-#     整条流上会出现的     = 前五种 + ToolResult → StreamEvent
+#     Provider 能产出的 = 前五种                        → ProviderEvent
+#     这条流上会出现的   = 前五种 + ToolResult + DecisionRequest
+#                                                      → StreamEvent
 #
-# 如果只留一个联合，`ChatProvider.stream()` 的返回类型就会包含 ToolResult ——
-# 那是在撒谎：Provider 根本没有能力产出「沙箱执行结果」。
+# 如果只留一个联合，`ChatProvider.stream()` 的返回类型就会包含 ToolResult 和
+# DecisionRequest —— 那是在撒谎：Provider 根本没有能力产出「沙箱执行结果」，
+# 更没有能力替 Agent 决定「该问用户了」。
 # 而谎言会让人写出 `isinstance(event, ToolResult)` 的防御性代码去防一个
 # 永远不会发生的情况，这种代码比没有更糟。
 #
@@ -210,7 +271,7 @@ ProviderEvent = Annotated[
 ]
 
 StreamEvent = Annotated[
-    TextDelta | ToolCallDelta | Usage | Finish | ErrorEvent | ToolResult,
+    TextDelta | ToolCallDelta | Usage | Finish | ErrorEvent | ToolResult | DecisionRequest,
     Field(discriminator="type"),
 ]
 

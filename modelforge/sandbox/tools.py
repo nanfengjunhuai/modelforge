@@ -35,12 +35,20 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from modelforge.providers.base import ToolSpec
-from modelforge.providers.events import ToolCall, ToolResult
+from modelforge.providers.events import DecisionRequest, ToolCall, ToolResult
 from modelforge.sandbox.base import CodeExecutor, ExecutionResult
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["TOOL_SPECS", "dispatch", "format_for_model"]
+__all__ = [
+    "ASK_USER_NAME",
+    "ASK_USER_SPEC",
+    "TOOL_SPECS",
+    "BadArguments",
+    "build_decision_request",
+    "dispatch",
+    "format_for_model",
+]
 
 
 # ══════════════════════════════════════════════════════ 工具声明
@@ -79,29 +87,106 @@ RUN_PYTHON_SPEC: ToolSpec = {
     },
 }
 
+ASK_USER_NAME = "ask_user"
+
+ASK_USER_SPEC: ToolSpec = {
+    "type": "function",
+    "function": {
+        "name": ASK_USER_NAME,
+        "description": (
+            "把决策权交给用户。调用它会**立刻暂停本次生成**，"
+            "等用户在界面上点选之后才继续。\n"
+            "\n"
+            "**什么时候该用它** —— 走到一个会影响后续全部工作的分岔口，"
+            "几条路各有优劣、没有客观最优解的时候。典型场景：\n"
+            "  · 选模型：熵权法客观但要求数据完整，AHP 能纳入主观判断但要用户给判断矩阵\n"
+            "  · 数据口径：异常值剔除策略会直接改变结论\n"
+            "  · 参数取值：用户手里可能有赛题之外的信息（队伍擅长什么、有没有现成软件）\n"
+            "\n"
+            "**什么时候不该用它**：\n"
+            "  · 有客观答案的自己去算，别问\n"
+            "  · **还没做功课的时候不要问。** 先把几个方案各自跑出数字，"
+            "带着具体结果来问 —— 「A 法算出来 0.42，B 法 0.38，差别主要在样本量」"
+            "是真的在帮忙；空着手问「你想怎么办」只是把工作推回给用户。\n"
+            "  · 一次只问一件，不要把所有问题攒成一张问卷\n"
+            "\n"
+            "**options 每一项都要写出「选它的代价」**，不能只写好处 ——"
+            "用户是在做取舍，不是在挑一个全面更好的。"
+            "「熵权法（客观，但要求数据完整）」比光写「熵权法」有用得多。\n"
+            "\n"
+            "**调用它时这一轮不要同时调用别的工具，让它独占一轮。**"
+            "这样用户能立刻看到问题，不用先等一段代码跑完。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": (
+                        "要问用户的问题，一句话说清楚**在什么之间做选择**。"
+                        "先说结论再说理由，不要写成一段背景介绍。"
+                    ),
+                },
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 2,
+                    "description": (
+                        "候选方案，每项一句话，格式是「方案名（代价或适用条件）」。"
+                        "至少两个 —— 只有一个选项不叫选择。"
+                    ),
+                },
+                "allow_free_text": {
+                    "type": "boolean",
+                    "description": (
+                        "是否允许用户用自由文本补充。默认为真。"
+                        "只有在选项已经穷尽了可能性时才设为假。"
+                    ),
+                },
+            },
+            "required": ["question", "options"],
+        },
+    },
+}
+
+# ⚠️ 注意这里**只有 run_python**。
+#
+# ask_user 不在 TOOL_SPECS 里，是刻意的：TOOL_SPECS 是**无状态端点**
+# (`POST /api/chat/stream`) 用的工具集。那个端点没有会话、没有事件日志、
+# 也没有任何地方能让用户回答 —— 给了它 ask_user 只会得到一个死胡同：
+# 模型停下来问，然后永远等不到答案。
+#
+# 有会话的端点显式地传 `TOOL_SPECS + [ASK_USER_SPEC]`。
 TOOL_SPECS: list[ToolSpec] = [RUN_PYTHON_SPEC]
 
-# 合法工具名集合。既用于派发，也用于提前告诉模型「你只有这些工具」。
-_TOOL_NAMES = frozenset(spec["function"]["name"] for spec in TOOL_SPECS)
+# 合法工具名集合。既用于派发，也用于告诉模型「你只有这些工具」
+# —— 模型幻觉出一个不存在的工具时，报错信息会列出这个集合。
+#
+# ask_user 必须在里面，哪怕它永远不会走到派发那一步：
+# 不在的话，模型会被告知「没有 ask_user 这个工具」，而它明明在工具列表里看到了。
+_TOOL_NAMES = frozenset({RUN_PYTHON_SPEC["function"]["name"], ASK_USER_NAME})
 
 
 # ══════════════════════════════════════════════════════ 参数校验
 
 
-class _BadArguments(Exception):
-    """参数不合法 —— 是**模型**写错了，不是代码写错了。
+class BadArguments(Exception):
+    """工具参数不合法 —— 是**模型**写错了，不是代码写错了。
 
     这类错误的特点是：把原因原样告诉模型，它下次就能改对。
     所以要让它流到模型的上下文里，而不是只记进日志。
+
+    名字没有下划线，因为 M4 起 Agent 循环也要 catch 它（`ask_user` 的参数
+    在循环里就解析了，不走 `dispatch`）。这个类名是模块对外契约的一部分。
     """
 
 
 def _require_code(args: dict[str, Any]) -> str:
     code = args.get("code")
     if not isinstance(code, str):
-        raise _BadArguments(f"参数 code 必须是字符串，实际收到 {type(code).__name__}")
+        raise BadArguments(f"参数 code 必须是字符串，实际收到 {type(code).__name__}")
     if not code.strip():
-        raise _BadArguments("参数 code 是空的，没有可执行的代码")
+        raise BadArguments("参数 code 是空的，没有可执行的代码")
     return code
 
 
@@ -115,6 +200,89 @@ async def _handle_run_python(args: dict[str, Any], executor: CodeExecutor) -> Ex
 
 
 _HANDLERS["run_python"] = _handle_run_python
+
+
+async def _handle_ask_user(args: dict[str, Any], executor: CodeExecutor) -> ExecutionResult:
+    """永远不会被正常调用到的处理器。
+
+    存在两个理由，都不是「以防万一」这么含糊：
+
+      ① `_HANDLERS[name]` 的查表在 `dispatch` 里。如果 ask_user 没有注册，
+         某天有人绕过循环的拦截逻辑直接调 dispatch，会撞一个 KeyError，
+         被兜成一句「执行工具时发生内部错误：KeyError」—— 完全找不到北。
+      ② 更常见的：**忘了在循环里拦截它**。那时这行报错会直白地说出问题所在，
+         而不是让一个「工具执行失败」的假象把人引向沙箱。
+
+    「让失败自己开口说话」是这个文件里反复出现的做法 —— 见 `format_for_model`
+    里那句「这不是你的代码的问题，不要靠修改代码来重试」。
+    """
+    raise BadArguments(
+        "ask_user 不是一个能被执行的工具，它由 Agent 循环拦截并转成一次用户决策。"
+        "走到这里说明循环里少了拦截逻辑。"
+    )
+
+
+_HANDLERS[ASK_USER_NAME] = _handle_ask_user
+
+
+# ══════════════════════════════════════════════════════ ask_user 的参数
+
+
+def build_decision_request(call: ToolCall) -> DecisionRequest:
+    """把一次 `ask_user` 调用翻译成一个 `DecisionRequest`，顺带校验参数。
+
+    为什么校验放在这里、而不是在 Agent 循环里？因为**这是参数校验**，
+    和 `_require_code` 是同一件事，应该和它待在一起。循环只该做「要不要中断」
+    这个判断，不该知道 question 是不是字符串。
+
+    Raises:
+        BadArguments: 模型把参数写歪了。调用方（Agent 循环）会把它变成一条
+            `ok=False` 的 ToolResult 回填给模型 —— 和 `run_python` 参数写错
+            时的待遇完全一样，因为这是同一类错误：**模型能自己修**。
+    """
+    try:
+        args = json.loads(call.arguments)
+    except json.JSONDecodeError as exc:
+        raise BadArguments(
+            f"参数不是合法的 JSON：{exc}\n收到的原文：{call.arguments[:200]}"
+        ) from exc
+
+    if not isinstance(args, dict):
+        raise BadArguments(f"参数必须是一个 JSON 对象，实际收到 {type(args).__name__}")
+
+    question = args.get("question")
+    if not isinstance(question, str) or not question.strip():
+        raise BadArguments("参数 question 必须是非空字符串")
+
+    raw_options = args.get("options")
+    if not isinstance(raw_options, list):
+        raise BadArguments(f"参数 options 必须是数组，实际收到 {type(raw_options).__name__}")
+
+    # 只留下非空字符串。
+    #
+    # ⚠️ 注意这里**没有**强制「至少两个选项」，尽管 JSON Schema 里写的是
+    # `minItems: 2`。声明和校验故意不一致：
+    #
+    #   · 声明是**引导** —— 告诉模型「正常情况该给几个」，影响它怎么写。
+    #   · 校验是**兜底** —— 只拦真正会让下游出错的东西。
+    #
+    # 一个只有单选项的「确认一下」是合法的交互（配上自由文本输入就够了），
+    # 为此把整轮打回去让模型重写，代价大于收益。真正的错误是 options 根本
+    # 不是数组、或者里面全是空字符串 —— 那才拦。
+    options = [opt.strip() for opt in raw_options if isinstance(opt, str) and opt.strip()]
+    if not options:
+        raise BadArguments("参数 options 里没有任何有效的字符串选项")
+
+    allow_free_text = args.get("allow_free_text", True)
+    if not isinstance(allow_free_text, bool):
+        raise BadArguments("参数 allow_free_text 必须是布尔值")
+
+    return DecisionRequest(
+        call_id=call.id,
+        question=question.strip(),
+        options=options,
+        allow_free_text=allow_free_text,
+    )
 
 
 # ══════════════════════════════════════════════════════ 派发
@@ -164,7 +332,7 @@ async def dispatch(call: ToolCall, *, executor: CodeExecutor) -> ToolResult:
     # ③ 逐字段校验 + 执行
     try:
         result = await _HANDLERS[call.name](args, executor)
-    except _BadArguments as exc:
+    except BadArguments as exc:
         return fail(str(exc))
     except Exception as exc:
         # 执行器自己炸了。契约要求它不抛异常，但这里是最后一道防线 ——
