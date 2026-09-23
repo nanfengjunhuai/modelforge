@@ -1,16 +1,24 @@
-"""SSE 流式对话端点 —— 把 M1 的事件模型推到浏览器。
+"""SSE 流式对话端点 —— 把 Agent 的事件流推到浏览器。
 
 ════════════════════════════════════════════════════════════════════════
 这个模块在整条链路上的位置
 ════════════════════════════════════════════════════════════════════════
 
-    Provider（M1）          本模块（M2）                 前端
-    StreamEvent       ──►   SSE 帧文本           ──►   fetch + ReadableStream
-    （Pydantic 对象）        "event:..\\ndata:..\\n\\n"      （web/src/lib/sse.ts）
+    Provider（M1）        Agent 循环（M3）        本模块（M2）            前端
+    ProviderEvent   ──►   + ToolResult      ──►   SSE 帧文本      ──►   fetch + 流式读
+    （Pydantic 对象）      （六种事件）             "event:..\\ndata:..\\n\\n"    （lib/sse.ts）
+
+本模块的职责只有两件：
+  ① 把请求翻译成一次 `run_agent_turn` 调用（含 Provider 装配、人设注入）
+  ② 把产出的事件渲染成 SSE 帧
+
+**工具调用、沙箱执行、多轮循环都不在这里** —— 那些在 `agents/loop.py`
+和 `sandbox/` 里。这个文件刻意保持成一个薄薄的传输层。
 
 M1 当初选 Pydantic 判别联合的回报，在这里兑现：`event.model_dump_json()`
 一行就把对象变成 SSE 的 data 载荷，一行手写序列化都不需要。
 连带的好处是 `type` 字段（判别子）天然就是 SSE 的 `event:` 名 —— 前端靠它分派。
+**M3 新增 ToolResult 事件时，这个文件一行都没改。**
 
 ════════════════════════════════════════════════════════════════════════
 关于「错误分成两种」
@@ -38,15 +46,19 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from modelforge.agents.loop import run_agent_turn
 from modelforge.agents.prompts import SYSTEM_PROMPT
 from modelforge.config import get_settings
 from modelforge.providers.base import ChatProvider, Message
 from modelforge.providers.events import ErrorEvent, Finish, StreamEvent
 from modelforge.providers.registry import get_provider
+from modelforge.sandbox.base import CodeExecutor
+from modelforge.sandbox.subprocess_exec import SubprocessExecutor
+from modelforge.sandbox.tools import TOOL_SPECS
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["close_providers", "format_sse", "router"]
+__all__ = ["close_providers", "format_sse", "get_executor", "router"]
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -111,6 +123,14 @@ class ChatRequest(BaseModel):
     )
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, gt=0)
+    tools: bool = Field(
+        default=True,
+        description=(
+            "是否允许 Agent 调用工具（目前只有 run_python，会在沙箱里真跑代码）。"
+            "关掉它就退化成纯聊天 —— 调试提示词时很有用，"
+            "因为工具声明的 JSON Schema 每次请求都要重发，占不少 token。"
+        ),
+    )
 
 
 # ══════════════════════════════════════════════════════ Provider 缓存
@@ -141,6 +161,21 @@ def _acquire_provider(name: str | None) -> ChatProvider:
         _providers[key] = provider
         logger.info("已装配 provider: %s", key)
     return provider
+
+
+def get_executor() -> CodeExecutor:
+    """构造代码执行器。
+
+    刻意**不缓存** —— 这一点和上面的 Provider 正好相反，值得说清楚为什么：
+    Provider 手里攥着 httpx 连接池，重复构造的代价是几百毫秒的握手；
+    而 SubprocessExecutor 的构造函数只是拼了两个路径字符串，没有任何 I/O。
+    没成本的东西不需要缓存，而缓存会带来「配置改了不生效」的麻烦。
+
+    做成模块级函数（而不是在端点里直接 new）是为了可测：
+    测试 monkeypatch 掉这个名字，就能塞一个假的执行器进来，
+    不需要真的去装一个沙箱环境。
+    """
+    return SubprocessExecutor()
 
 
 async def close_providers() -> None:
@@ -200,8 +235,14 @@ async def stream_chat(payload: ChatRequest, request: Request) -> StreamingRespon
 
     async def event_stream() -> AsyncIterator[str]:
         try:
-            async for event in provider.stream(
+            # 注意这里调的不是 provider.stream 而是 run_agent_turn ——
+            # 后者在中间又套了一层「模型要工具 → 沙箱执行 → 结果回填」的循环，
+            # 并且负责保证整条流里**恰好有一个** Finish（见 agents/loop.py）。
+            async for event in run_agent_turn(
+                provider,
                 messages,
+                executor=get_executor(),
+                tools=TOOL_SPECS if payload.tools else None,
                 temperature=payload.temperature,
                 max_tokens=payload.max_tokens,
             ):

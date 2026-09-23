@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any, Protocol, runtime_checkable
 
-from modelforge.providers.events import StreamEvent
+from modelforge.providers.events import ProviderEvent
 
 __all__ = ["ChatProvider", "Message", "ToolSpec"]
 
@@ -61,8 +61,12 @@ class ChatProvider(Protocol):
         tools: list[ToolSpec] | None = None,
         temperature: float = 0.2,
         max_tokens: int | None = None,
-    ) -> AsyncIterator[StreamEvent]:
+    ) -> AsyncIterator[ProviderEvent]:
         """流式生成，逐段吐出归一化事件。
+
+        ⚠️ 返回的是 `ProviderEvent`（五种），不是 `StreamEvent`（六种）。
+        Provider **没有能力**产出 `ToolResult` —— 那是沙箱跑完代码之后由
+        Agent 循环造出来的。用类型把这条边界划清楚，比写注释可靠。
 
         实现者应该写成一个 `async def` + `yield` 的异步生成器（这里用 `def` 声明
         是因为「异步生成器函数」的类型本来就是 `Callable[..., AsyncIterator]`）。

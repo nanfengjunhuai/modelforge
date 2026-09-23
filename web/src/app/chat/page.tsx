@@ -32,7 +32,7 @@ import Link from 'next/link'
 import { useEffect, useRef, useState } from 'react'
 
 import { streamChat, type ChatMessage } from '@/lib/sse'
-import type { FinishReason } from '@/lib/stream-types'
+import type { FinishReason, ToolResultEvent } from '@/lib/stream-types'
 
 // ══════════════════════════════════════════════════════ 类型
 
@@ -52,11 +52,28 @@ type Msg = {
   tools: ToolCallView[]
 }
 
-/** 界面上呈现的一个工具调用。字段含义见 lib/stream-types.ts。 */
+/**
+ * 界面上呈现的一个工具调用。
+ *
+ * 注意它把「调用」和「结果」**合成了一条**，而后端是分成两个事件发的
+ * （tool_call_delta / tool_result）。合并的理由：
+ *
+ *   分开存的话，界面渲染时要按 id 去另一个数组里查配对，
+ *   而且「结果先到、调用后到」这种乱序会让查询落空。
+ *   合成一条之后，`result === null` 天然就表示「还在跑」，
+ *   不需要额外的状态字段。
+ *
+ * `id` 是配对的钥匙。后端的 ToolResult 带的是 call_id，而 call_id 只在
+ * **第一个** tool_call_delta 碎片里出现 —— 所以累加时要记住它，
+ * 不能像 name/args 那样无脑相加。
+ */
 type ToolCallView = {
   index: number
+  id: string | null
   name: string
+  /** 未解析的 JSON 字符串碎片，边流边拼。解析见 extractCode()。 */
   args: string
+  result: ToolResultEvent | null
 }
 
 /** 上一轮跑完之后的统计，显示在回答下面。 */
@@ -78,10 +95,33 @@ type TurnMeta = {
  */
 const FINISH_LABEL: Record<FinishReason, string> = {
   stop: '正常结束',
-  tool_calls: '请求调用工具',
+  tool_calls: '正在调用工具',
   length: '撞到长度上限被截断，上面的内容可能不完整',
   content_filter: '被内容安全策略拦截',
   error: '异常终止',
+  max_rounds: '工具调用次数达到上限，它被喊停了',
+}
+
+/**
+ * 从累积的 JSON 碎片里把代码抠出来。
+ *
+ * 为什么要 try/catch？因为**流式过程中这个字符串一直是残缺的**：
+ * arguments 是一段一段到的，任何中间时刻 `JSON.parse` 都会抛异常。
+ * 这不是错误处理，这是正常状态 —— 参数还没流完而已。
+ *
+ * 返回 null 时界面显示「正在生成参数…」，而不是硬撑着显示一段半截 JSON。
+ */
+function extractCode(args: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(args)
+    if (parsed && typeof parsed === 'object' && 'code' in parsed) {
+      const code = (parsed as { code: unknown }).code
+      if (typeof code === 'string') return code
+    }
+    return null
+  } catch {
+    return null
+  }
 }
 
 /** 空状态下的引导语。降低第一次使用的门槛。 */
@@ -192,33 +232,71 @@ export default function ChatPage() {
             break
 
           // ── 工具调用碎片：按 index 累积 ──
-          // M2 阶段后端还没下发任何工具，这个分支不会走到。
-          // 现在写好，是为了 M3 接沙箱时前端一行都不用改。
           case 'tool_call_delta':
             setMessages((prev) =>
               prev.map((m) => {
                 if (m.id !== assistantId) return m
-                const exists = m.tools.some((t) => t.index === event.index)
-                const tools = exists
-                  ? m.tools.map((t) =>
-                      t.index === event.index
-                        ? {
-                            ...t,
-                            // ⚠️ 累加，不是赋值 —— name 和 arguments 都可能分片到达。
-                            //    这是 M1 里那个「碎片要累积」的教训在前端的复现。
-                            name: t.name + (event.name ?? ''),
-                            args: t.args + event.arguments_delta,
-                          }
-                        : t,
-                    )
-                  : [
+
+                if (!m.tools.some((t) => t.index === event.index)) {
+                  return {
+                    ...m,
+                    tools: [
                       ...m.tools,
                       {
                         index: event.index,
+                        id: event.id, // 只在首个碎片里出现
                         name: event.name ?? '',
                         args: event.arguments_delta,
+                        result: null,
                       },
-                    ]
+                    ],
+                  }
+                }
+
+                return {
+                  ...m,
+                  tools: m.tools.map((t) =>
+                    t.index === event.index
+                      ? {
+                          ...t,
+                          // ⚠️ 注意 id 和下面两个的规则**不一样**：
+                          //    id 是「赋值」（首个碎片给了之后，后续都是 null），
+                          //    name / args 是「累加」（真的会分片到达）。
+                          //    搞混了不会立刻出错 —— id 拼成 "call_xx" + "" 还是原样，
+                          //    但只要哪个服务多发一次 id，就变成 "call_xxcall_xx" 了。
+                          id: t.id ?? event.id,
+                          name: t.name + (event.name ?? ''),
+                          args: t.args + event.arguments_delta,
+                        }
+                      : t,
+                  ),
+                }
+              }),
+            )
+            break
+
+          // ── 工具执行结果：认领到对应的那张卡片上 ──
+          case 'tool_result':
+            setMessages((prev) =>
+              prev.map((m) => {
+                if (m.id !== assistantId) return m
+
+                const claimed = m.tools.map((t) =>
+                  t.id === event.call_id ? { ...t, result: event } : t,
+                )
+                if (claimed.some((t) => t.result === event)) {
+                  return { ...m, tools: claimed }
+                }
+
+                // 兜底：id 对不上时按顺序认领第一张还没结果的卡片。
+                // 什么时候会对不上？有的兼容服务根本不返回工具调用 id，
+                // 后端会用 "call_{index}" 补一个占位，跟前端拼出来的对不上号。
+                // 并行调多个工具时这个兜底可能配错 —— 但配错的后果只是
+                // 卡片和结果的对应关系乱了，文字内容不受影响。
+                const index = claimed.findIndex((t) => t.result === null)
+                if (index === -1) return m
+                const tools = [...claimed]
+                tools[index] = { ...tools[index], result: event }
                 return { ...m, tools }
               }),
             )
@@ -462,19 +540,125 @@ function MessageBubble({ msg, streaming }: { msg: Msg; streaming: boolean }) {
         )}
       </div>
 
-      {/* 工具调用提示（M3 才会出现） */}
+      {/* 工具执行卡片 */}
       {msg.tools.length > 0 && (
-        <div className="mt-3 flex flex-wrap gap-2">
+        <div className="mt-4 flex flex-col gap-3">
           {msg.tools.map((t) => (
-            <span
-              key={t.index}
-              className="rounded-control border border-hairline bg-surface px-3 py-1.5 text-caption text-ink-secondary"
-            >
-              调用工具 <code className="text-brand-600">{t.name || '…'}</code>
-            </span>
+            <ToolCallCard key={t.index} call={t} />
           ))}
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * 一张工具执行卡片：状态头 + 代码 + 输出。
+ *
+ * 这是 M3 最重要的界面元素 —— 它把「Agent 在后台干了什么」摊开给用户看。
+ * 没有它，用户只能看到模型说「我算出来是 5050」，无从判断这个数是怎么来的。
+ */
+function ToolCallCard({ call }: { call: ToolCallView }) {
+  // 折叠状态交给 React 管（受控），而不是让 <details> 自己管（非受控）。
+  // 非受控的话会有一个很隐蔽的坑：组件每次重渲染，React 都会把 open 属性
+  // 按 vdom 里的值重新写一遍，把用户手动折叠的状态冲掉。
+  // 受控写法多三行，但行为是可预期的。
+  const [open, setOpen] = useState(true)
+
+  const result = call.result
+  const code = extractCode(call.args)
+
+  // 五种状态，用一张表而不是散落的 if 链。
+  // 散落的 if 会漏掉组合情况（比如「超时」和「沙箱报错」同时为真时该画什么），
+  // 而这里是从上往下第一个匹配的胜出，顺序即优先级。
+  const status = !result
+    ? { dot: 'bg-brand-500', ink: 'text-brand-600', label: '正在执行…', running: true }
+    : result.error
+      ? { dot: 'bg-critical', ink: 'text-critical-ink', label: '沙箱未能执行', running: false }
+      : result.timed_out
+        ? { dot: 'bg-warning', ink: 'text-warning-ink', label: '执行超时被终止', running: false }
+        : result.ok
+          ? { dot: 'bg-good', ink: 'text-good-ink', label: '执行成功', running: false }
+          : { dot: 'bg-serious', ink: 'text-serious-ink', label: '运行出错', running: false }
+
+  // 状态色永远配「圆点或转圈 + 文字」，不靠颜色单独传达信息 ——
+  // 这是设计系统定下的硬性约束（见 globals.css 的注释）。
+  const indicator = status.running ? (
+    <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-grid border-t-brand-500" />
+  ) : (
+    <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${status.dot}`} />
+  )
+
+  // stderr 的颜色取决于「这次算不算失败」：
+  //   失败 → 用警示色（这是要看的报错）
+  //   成功 → 用弱化色（多半只是 numpy 的 DeprecationWarning 之类，别吓唬人）
+  const stderrInk = result?.ok ? 'text-ink-muted' : 'text-serious-ink'
+
+  return (
+    <div className="overflow-hidden rounded-card border border-hairline bg-surface">
+      {/* ── 状态头：始终可见，不看细节也能知道跑没跑成 ── */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5 text-caption">
+        {indicator}
+        <code className="font-medium text-ink">{call.name || '…'}</code>
+        <span className={status.ink}>{status.label}</span>
+        {result && (
+          <span className="ml-auto font-mono text-ink-muted">
+            {result.duration_ms} ms
+            {result.exit_code !== null && ` · 退出码 ${result.exit_code}`}
+          </span>
+        )}
+      </div>
+
+      {/* ── 主体：代码 + 输出，可折叠 ── */}
+      <details
+        open={open}
+        onToggle={(e) => {
+          const next = e.currentTarget.open
+          // onToggle 在挂载时也会触发一次，这时候状态没变，跳过以避免多余渲染
+          if (next !== open) setOpen(next)
+        }}
+        className="border-t border-hairline"
+      >
+        <summary className="cursor-pointer select-none px-4 py-2 text-caption text-ink-muted transition-colors hover:text-ink-secondary">
+          代码与输出
+        </summary>
+
+        <pre className="overflow-x-auto border-t border-hairline px-4 py-3 text-caption leading-relaxed text-ink-secondary">
+          {code ?? '（参数还在生成中……）'}
+        </pre>
+
+        {result && (
+          <div className="border-t border-hairline bg-plane">
+            {result.error && (
+              <p className="px-4 py-3 text-caption leading-relaxed text-critical-ink">
+                {result.error}
+              </p>
+            )}
+
+            {result.stdout && (
+              <pre className="max-h-72 overflow-auto px-4 py-3 text-caption leading-relaxed text-ink-secondary">
+                {result.stdout}
+              </pre>
+            )}
+
+            {result.stderr && (
+              <pre
+                className={`max-h-72 overflow-auto px-4 py-3 text-caption leading-relaxed ${stderrInk} ${
+                  result.stdout ? 'border-t border-hairline' : ''
+                }`}
+              >
+                {result.stderr}
+              </pre>
+            )}
+
+            {!result.stdout && !result.stderr && !result.error && (
+              <p className="px-4 py-3 text-caption text-ink-muted">
+                （没有任何输出。它大概是忘了 print。）
+              </p>
+            )}
+          </div>
+        )}
+      </details>
     </div>
   )
 }

@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from typing import Any
@@ -35,7 +36,9 @@ for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
-BASE = "http://127.0.0.1:8000"
+# 后端地址。可用 MODELFORGE_BASE 覆盖 —— 排查问题时常常要同时开两个后端
+# （一个带 --reload，一个不带）做对照实验，硬编码就没法比了。
+BASE = os.environ.get("MODELFORGE_BASE", "http://127.0.0.1:8000")
 DEFAULT_PROMPT = "用三句话解释什么是熵权法"
 
 # 首帧耗时超过总耗时的这个比例，就值得怀疑被缓冲了
@@ -72,6 +75,7 @@ def main() -> int:
     first_frame_ms: float | None = None
     frames = 0
     text_chars = 0
+    tool_calls = 0
     usage: dict[str, Any] | None = None
     finish_reason: str | None = None
     error_message: str | None = None
@@ -109,23 +113,44 @@ def main() -> int:
                 event = json.loads(line[len("data: ") :])
                 kind = event["type"]
 
+                stamp = f"[{elapsed_ms:8.0f}ms +{gap_ms:6.0f}ms]"
+
                 if kind == "text_delta":
                     text = event["text"]
                     text_chars += len(text)
                     # 把换行显示成 ⏎，免得把表格输出搞乱
-                    shown = text.replace("\n", "⏎")
-                    print(f"[{elapsed_ms:8.0f}ms +{gap_ms:6.0f}ms] 文字  {shown}")
+                    print(f"{stamp} 文字  {text.replace(chr(10), '⏎')}")
+                elif kind == "tool_call_delta":
+                    # 碎片是逐字符到的，全打出来太吵。只报「开始拼装」那一下。
+                    if event.get("name"):
+                        tool_calls += 1
+                        print(f"{stamp} 调用  {event['name']}  ← 模型决定跑代码了")
+                elif kind == "tool_result":
+                    status = "成功" if event["ok"] else "失败"
+                    if event.get("timed_out"):
+                        status = "超时"
+                    print(
+                        f"{stamp} 结果  {event['name']} {status}"
+                        f" · {event['duration_ms']}ms · 退出码 {event['exit_code']}"
+                    )
+                    # 把代码的输出缩进显示，让它和事件流区分开
+                    for line in (event.get("stdout") or "").splitlines():
+                        print(f"{'':>22}│ {line}")
+                    for line in (event.get("stderr") or "").splitlines():
+                        print(f"{'':>22}! {line}")
+                    if event.get("error"):
+                        print(f"{'':>22}! {event['error']}")
                 elif kind == "usage":
                     usage = event
-                    print(f"[{elapsed_ms:8.0f}ms +{gap_ms:6.0f}ms] 用量  {event}")
+                    print(f"{stamp} 用量  {event}")
                 elif kind == "finish":
                     finish_reason = event["reason"]
-                    print(f"[{elapsed_ms:8.0f}ms +{gap_ms:6.0f}ms] 结束  {event['reason']}")
+                    print(f"{stamp} 结束  {event['reason']}")
                 elif kind == "error":
                     error_message = event["message"]
-                    print(f"[{elapsed_ms:8.0f}ms +{gap_ms:6.0f}ms] 错误  {event}")
+                    print(f"{stamp} 错误  {event}")
                 else:
-                    print(f"[{elapsed_ms:8.0f}ms +{gap_ms:6.0f}ms] {kind}  {event}")
+                    print(f"{stamp} {kind}  {event}")
     except Exception as exc:
         return _die(f"读流时出错（{type(exc).__name__}: {exc}）")
 
@@ -137,7 +162,10 @@ def main() -> int:
         return _die("一帧都没收到 —— 后端可能挂了，或者路径写错了")
 
     ratio = first_frame_ms / total_ms if total_ms else 1.0
-    print(f"共 {frames} 帧 / {text_chars} 字，首帧 {first_frame_ms:.0f}ms，总耗时 {total_ms:.0f}ms")
+    print(
+        f"共 {frames} 帧 / {text_chars} 字 / {tool_calls} 次工具调用，"
+        f"首帧 {first_frame_ms:.0f}ms，总耗时 {total_ms:.0f}ms"
+    )
     print(f"首帧占总裁  {ratio:.0%}")
 
     ok = True

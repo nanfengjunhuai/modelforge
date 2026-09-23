@@ -8,14 +8,20 @@
  * 是一串字节，前端拿到的 `JSON.parse` 结果是 `any` —— 类型系统在这里断了。
  *
  * 这个文件的作用就是**把类型接回来**：告诉编译器「我保证这条流里只会出现
- * 这五种形状」。之后 `switch (event.type)` 就能得到完整的类型收窄，
+ * 这六种形状」。之后 `switch (event.type)` 就能得到完整的类型收窄，
  * 写错字段名、漏掉分支，`tsc` 会在编译期就报错。
  *
  * ⚠️ **这个文件与 events.py 是手动同步的。** 后端加一种事件类型时，
- *    这里必须跟着加，否则前端的 switch 会静默走进 default 分支。
- *    这是「没有共享类型定义」这个选择的代价 —— 换来的是不用为了两个语言
- *    的互操作引入一套代码生成工具链。
- *    M5 会写一个测试来盯住这件事（对比两边的 type 取值集合）。
+ *    这里必须跟着加，否则前端的 switch 会静默走进 default 分支 ——
+ *    不报错，只是那个事件永远不显示。这是「没有共享类型定义」这个选择的代价，
+ *    换来的是不用为了两个语言的互操作引入一整套代码生成工具链。
+ *
+ *    这道防线现在有两层：
+ *      ① 后端 `tests/test_event_contract.py` 直接比对两边的 type 取值集合，
+ *         后端加了事件却忘了改前端，CI 会红；
+ *      ② 前端 `FINISH_LABEL` 是 `Record<FinishReason, string>`，
+ *         新增结束原因会直接编译不过。
+ *    第 ① 条管事件类型，第 ② 条管枚举取值 —— 两者合起来覆盖面才完整。
  *
  * ── 与后端一一对应的关系 ──
  *   Python 的 `Literal["text_delta"]`  →  TS 的 `type: 'text_delta'`
@@ -25,13 +31,21 @@
  * 这个思路从 page.tsx 的 `Status`、到 Pydantic 的事件模型、到这里，一路没变过。
  */
 
-/** 一轮生成是怎么结束的。取值与后端 `FinishReason` 完全一致。 */
+/**
+ * 一轮生成是怎么结束的。取值与后端 `FinishReason` 完全一致。
+ *
+ * ⚠️ 后端**加一个新取值时，这个文件不改就编译不过** ——
+ *    因为下面 FINISH_LABEL 的类型是 `Record<FinishReason, string>`，
+ *    漏一个 key 就是类型错误。这是故意的：让编译器替我们记住同步这件事，
+ *    比靠人记住可靠。
+ */
 export type FinishReason =
   | 'stop' // 正常说完了
-  | 'tool_calls' // 模型要求执行工具（M3 会用到）
+  | 'tool_calls' // 模型要求执行工具（中间轮次的这个值会被 Agent 循环吃掉）
   | 'length' // 撞到 max_tokens 被截断 —— 结果可能不完整
   | 'content_filter' // 被内容安全策略拦截
   | 'error' // 异常终止，前面通常已经有一条 error 事件
+  | 'max_rounds' // 工具调用轮数达到上限，Agent 循环主动收尾
 
 /** 模型吐出的一小段文本。产品体验的核心：它到了就立刻显示。 */
 export type TextDelta = {
@@ -86,6 +100,32 @@ export type ErrorEvent = {
 }
 
 /**
+ * 一次工具执行的结果。
+ *
+ * ⚠️ 这是唯一一个**不是模型发出来的**事件 —— 它是后端跑完代码之后自己造的。
+ * 后端为此把事件模型拆成了两个联合（`ProviderEvent` 五种 / `StreamEvent` 六种），
+ * 就是为了让「Provider 产不出 ToolResult」这件事在类型层面成立。
+ *
+ * 三个错误字段的区别，决定了界面上该画成什么样：
+ *   · `ok === false` + 有 stderr  → 代码跑了但报错（正常，模型会自己修）
+ *   · `timed_out`                 → 跑太久被杀了
+ *   · `error` 非空                → **我们这边**的问题（参数坏了、沙箱没装好），
+ *                                   模型改代码也没用，该提示用户去处理
+ */
+export type ToolResultEvent = {
+  type: 'tool_result'
+  call_id: string
+  name: string
+  ok: boolean
+  stdout: string
+  stderr: string
+  exit_code: number | null
+  duration_ms: number
+  timed_out: boolean
+  error: string | null
+}
+
+/**
  * 一条流里可能出现的所有事件。
  *
  * 用法：`switch (event.type)` —— TypeScript 会在这个联合上做穷尽性检查，
@@ -97,3 +137,4 @@ export type StreamEvent =
   | UsageEvent
   | FinishEvent
   | ErrorEvent
+  | ToolResultEvent

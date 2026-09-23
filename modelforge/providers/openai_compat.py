@@ -26,7 +26,7 @@ from modelforge.providers.events import (
     ErrorEvent,
     Finish,
     FinishReason,
-    StreamEvent,
+    ProviderEvent,
     TextDelta,
     ToolCallDelta,
     Usage,
@@ -68,7 +68,7 @@ def classify_finish_reason(raw: str | None) -> FinishReason:
     return _FINISH_MAP.get(raw, "stop")
 
 
-def chunk_to_events(chunk: Any) -> list[StreamEvent]:
+def chunk_to_events(chunk: Any) -> list[ProviderEvent]:
     """把一个 OpenAI 流式 chunk 映射成零到多个归一化事件。
 
     **这是一个纯函数** —— 不碰网络、不发请求、没有副作用。
@@ -78,7 +78,7 @@ def chunk_to_events(chunk: Any) -> list[StreamEvent]:
     一个 chunk 为什么可能产出「多个」事件？因为同一次增量里可能同时包含
     文本内容和工具调用碎片（模型一边说话一边决定调工具）。
     """
-    events: list[StreamEvent] = []
+    events: list[ProviderEvent] = []
 
     # 用量信息在最后一个 chunk 里，此时 choices 是空数组。
     # 所以这个判断必须在遍历 choices 之前。

@@ -12,6 +12,8 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+# 沙箱的独立环境（ADR-005）。它由 scripts/setup_sandbox.py 生成，不入库。
+.venv-sandbox/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/

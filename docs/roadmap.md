@@ -13,8 +13,8 @@
 | — | 设计系统（在 M1 前插入完成） | ✅ |
 | M1 | Provider 抽象层 | ✅ 已通过真实模型验证 |
 | M2 | SSE 流式协议 + 前端流式渲染 | ✅ 已通过真实模型验证 |
-| M3 | 工具调用 + 沙箱执行 | ⬅ 下一步 |
-| M4 | HITL 中断/恢复 + 状态持久化 | |
+| M3 | 工具调用 + 沙箱执行 | ✅ 已通过真实模型验证 |
+| M4 | HITL 中断/恢复 + 状态持久化 | ⬅ 下一步 |
 | M5 | 完整工作台 UI + 交互图表 | |
 | M6 | 报告生成、部署、文档 | |
 
@@ -197,6 +197,73 @@ M1 处理过「JSON 参数碎片」，M2 又遇到两种更隐蔽的：
 
 ---
 
+## M3 已完成：工具调用 + 沙箱执行
+
+### 交付物
+
+| 文件 | 职责 |
+|---|---|
+| `modelforge/sandbox/base.py` | `CodeExecutor` 协议 + `ExecutionResult`，含**安全边界的诚实说明** |
+| `modelforge/sandbox/subprocess_exec.py` | 子进程执行器（隔离、超时、进程树清理） |
+| `modelforge/sandbox/tools.py` | `run_python` 的工具声明 + 参数校验 + 回填格式 |
+| `modelforge/agents/loop.py` | Agent 循环：模型要工具 → 执行 → 回填 → 再问，直到它说停 |
+| `scripts/setup_sandbox.py` | 一键创建 `.venv-sandbox` 并自检 |
+| `tests/test_event_contract.py` | **跨语言**契约测试（Python 事件模型 vs TS 镜像） |
+
+事件模型新增第六种事件 `ToolResult`，并拆成两个联合：
+`ProviderEvent`（五种，Provider 能产出的）/ `StreamEvent`（六种，流上会出现的）。
+理由：Provider **没有能力**产出工具执行结果，让类型说实话。
+
+### 验收结果
+
+- [x] 模型能真的调用 `run_python` 并在沙箱里执行
+- [x] 执行结果回填给模型，模型据此继续推理
+- [x] 失败（traceback / 超时 / 坏参数）都能自我修复或如实上报
+- [x] 沙箱里的代码拿不到 API Key（有测试）
+- [x] 前端把代码、输出、耗时、退出码都摊开显示
+
+### 实测
+
+一个「用 numpy 算平方和再开方」的请求：
+
+    模型调用 run_python → 沙箱执行 155ms → stdout 回填 → 模型给出结论
+
+工具调用前 prompt 993 tokens，两轮之后 1643 tokens。
+
+### ⚠️ 两个只有端到端才测得出来的 bug
+
+这一节是 M3 最值得留下的东西。两个 bug 都有同一个特征：
+**86 个单元测试全绿，一接到真实服务器上就炸。**
+
+**① `NotImplementedError:`（消息是空的）**
+
+    起因：Windows 上 asyncio 的 SelectorEventLoop **根本不支持子进程**。
+    修法：不用 asyncio 的子进程 API，改用 `asyncio.to_thread` 包阻塞式
+          `subprocess.Popen`。任何事件循环都能跑。
+    教训：**不要把功能正确性押在「服务器碰巧选了哪个事件循环」上。**
+         而且这个选择发生在我们代码被 import 之前，应用层管不着。
+
+**② 随机的 `KeyboardInterrupt`（退出码 3221225786）**
+
+    起因：沙箱每次执行都往**项目目录内**写一个 `solution.py`，
+         而 uvicorn 的 `--reload` 正盯着项目目录 ——
+         一看有新文件就热重载，重载的终止信号顺着控制台传到了
+         正在跑代码的沙箱子进程上。竞态，所以时灵时不灵，
+         而第一次 `import numpy` 最慢、窗口最宽，看起来像「第一次必挂」。
+    修法：工作目录挪到系统临时目录，并在配置落进项目里时打警告。
+    证据：uvicorn 日志里那句
+          `WatchFiles detected changes in 'sandbox_tmp\run-xxx\solution.py'. Reloading...`
+
+**共同教训**：单元测试的**环境**往往比真实环境宽松（pytest 用默认事件循环、
+不起 reloader）。所以「测试通过」给的是信心，不是证据 ——
+每个里程碑都要真的把服务跑起来、用真模型走一遍。
+
+⚠️ **给 M5 的提醒**：生成图表要存「产物」时，**不要**存进项目里的
+`artifacts/`，那会重新触发问题 ②。存系统目录 + 接口下载，
+或者给 uvicorn 配 `--reload-exclude`。
+
+---
+
 ## 环境备忘
 
 - `.venv` = Python 3.12.4（从 Anaconda base 的 python.exe 创建）
@@ -212,3 +279,6 @@ M1 处理过「JSON 参数碎片」，M2 又遇到两种更隐蔽的：
 | `WinError 10013` | 端口被占用（报错信息完全没提这点） | `netstat -ano \| findstr :8000` 拿 PID → `taskkill /F /PID <pid>` |
 | 前端跑到 3001 端口 | 3000 被占 | **必须在 3000**，因为 CORS 白名单只放行了它 |
 | `ModuleNotFoundError: modelforge` | editable 安装的查找器映射为空 | 在项目根目录重跑 `pip install -e .` |
+| 沙箱报 `NotImplementedError`（**消息为空**） | Windows 上 SelectorEventLoop 不支持子进程 | 已修：改用线程跑阻塞式 Popen。若复现，检查是否有代码走回了 asyncio 子进程 API |
+| 沙箱随机 `KeyboardInterrupt`，退出码 `3221225786` | 沙箱工作目录在项目内，触发了 `--reload` | 已修：默认改到系统临时目录。检查有没有把 `SANDBOX_WORK_DIR` 配回项目里 |
+| 沙箱说「解释器不存在」 | 还没建 `.venv-sandbox` | `.venv/Scripts/python scripts/setup_sandbox.py` |

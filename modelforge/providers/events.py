@@ -42,11 +42,13 @@ __all__ = [
     "ErrorEvent",
     "Finish",
     "FinishReason",
+    "ProviderEvent",
     "StreamEvent",
     "TextDelta",
     "ToolCall",
     "ToolCallAccumulator",
     "ToolCallDelta",
+    "ToolResult",
     "Usage",
 ]
 
@@ -57,7 +59,7 @@ __all__ = [
 #      —— 这条规则帮我抓出过一次真实疏漏：classify_finish_reason 原先声明返回 str，
 #         等于放弃了「只返回合法值」的保证，mypy 在赋值处报错才暴露出来；
 #   3. M2 生成 JSON Schema 时，前端能直接拿到这个枚举约束。
-FinishReason = Literal["stop", "tool_calls", "length", "content_filter", "error"]
+FinishReason = Literal["stop", "tool_calls", "length", "content_filter", "error", "max_rounds"]
 
 
 # ══════════════════════════════════════════════════════ 五种事件
@@ -112,6 +114,14 @@ class Finish(BaseModel):
       · "length"          撞到 max_tokens 被截断（上层应据此判断结果可能不完整）
       · "content_filter"  被内容安全策略拦截
       · "error"           异常终止（此时前面通常已有一条 ErrorEvent）
+      · "max_rounds"      工具调用轮数达到上限，Agent 循环主动收尾
+
+    最后这个值**只有 Agent 循环会产出**，Provider 永远不会。加它而不是复用
+    "length"，是因为两者对用户意味着不同的东西：length 是「回答被截断了」，
+    max_rounds 是「它算得太久了，我喊停的」。
+    顺带一提，加这个值的成本只有一行 —— 前端那份 TypeScript 镜像会因为
+    `Record<FinishReason, string>` 漏了 key **编译报错**，逼着人补上。
+    这就是当初把 FinishReason 抽成类型别名、而不是散写字面量的回报。
     """
 
     type: Literal["finish"] = "finish"
@@ -136,11 +146,71 @@ class ErrorEvent(BaseModel):
     retryable: bool = False
 
 
+# ══════════════════════════════════════════════════════ 沙箱事件
+#
+# ⚠️ 下面这个事件**不是模型发出来的**，是我们自己跑完代码之后造出来的。
+#    它是目前唯一一个「非 Provider 来源」的事件 —— 这正是要把两个联合类型
+#    分开的原因（见本文件末尾）。
+
+
+class ToolResult(BaseModel):
+    """一次工具执行的结果。
+
+    为什么要把 stdout / stderr / 错误**分开**，而不是揉成一段文本？
+    因为三者的读者不同：
+
+      · `stdout` / `stderr` —— 会被原样回填给模型，是它的「眼睛」
+      · `ok` / `timed_out`  —— 给**界面**看的，决定这块卡片画成绿的还是红的
+      · `error`             —— 给我们自己看的（参数解析失败、找不到解释器等），
+                               这种错误模型看了也没用，因为它不是代码的问题
+
+    揉成一段的话，界面就没法区分「代码跑完了但有报错」（正常，模型会自己修）
+    和「代码压根没跑起来」（我们这边的问题），而这两件事该给用户完全不同的提示。
+    """
+
+    type: Literal["tool_result"] = "tool_result"
+    call_id: str
+    name: str
+    ok: bool
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: int | None = None
+    duration_ms: int = 0
+    timed_out: bool = False
+    # 我们这边的失败（参数不是合法 JSON、沙箱解释器不存在……），不是代码的失败
+    error: str | None = None
+
+
+# ══════════════════════════════════════════════════════ 判别联合
+
 # 判别联合：Pydantic 会按 `type` 字段自动派发到具体类型。
 # 注意这里必须用 Annotated + Field(discriminator=...)，否则 Pydantic 会尝试
 # 逐个匹配所有成员，既慢又容易误判。
-StreamEvent = Annotated[
+#
+# 为什么是两个联合而不是一个？
+# ------------------------------
+# 因为「Provider 能产出什么」和「这条流上会出现什么」是**两件事**：
+#
+#     Provider 能产出的   = 前五种              → ProviderEvent
+#     整条流上会出现的     = 前五种 + ToolResult → StreamEvent
+#
+# 如果只留一个联合，`ChatProvider.stream()` 的返回类型就会包含 ToolResult ——
+# 那是在撒谎：Provider 根本没有能力产出「沙箱执行结果」。
+# 而谎言会让人写出 `isinstance(event, ToolResult)` 的防御性代码去防一个
+# 永远不会发生的情况，这种代码比没有更糟。
+#
+# 这和前端 `type Status = 'idle' | ...` 是同一个思路，只是往上提了一层：
+# **用类型把「谁能干什么」划清楚，而不是靠约定和注释。**
+#
+# 代价：两个联合的成员列表有重复，加新事件时要记得两边都写。
+# 这个代价由 tests/test_event_contract.py 兜底 —— 它会比对两边的 type 取值集合。
+ProviderEvent = Annotated[
     TextDelta | ToolCallDelta | Usage | Finish | ErrorEvent,
+    Field(discriminator="type"),
+]
+
+StreamEvent = Annotated[
+    TextDelta | ToolCallDelta | Usage | Finish | ErrorEvent | ToolResult,
     Field(discriminator="type"),
 ]
 
