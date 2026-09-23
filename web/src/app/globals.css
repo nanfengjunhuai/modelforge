@@ -1,26 +1,242 @@
 @import "tailwindcss";
 
+/* ═══════════════════════════════════════════════════════════════════════
+   ModelForge 设计系统
+   ───────────────────────────────────────────────────────────────────────
+   这里是全站视觉的唯一真相来源。所有颜色、字号、圆角都在这里定义一次，
+   后面每写一个新组件都直接继承，不要在任何组件里硬编码十六进制色值。
+
+   【为什么图表和 UI 用同一套色】
+   ModelForge 是图表密集型产品。如果 UI 一套色、图表另一套色，成品会看起来
+   像两个产品拼起来的。所以两层的色值同源。
+
+   【这些值是怎么来的】
+   大部分取自一份已经过校验的参考调色板；少部分（标注了「推导」的）是我针对
+   本项目的表面色重新计算并验证过的。**颜色是可计算的，不要靠眼睛判断。**
+
+   校验结论（用 validate_palette.js 跑出来的，非估计）：
+     · 分类色板 亮/暗 两模式全部通过明度带、彩度下限、CVD 分离率检查
+     · 亮色模式有 3 个色低于 3:1 对比度（青/黄/品红）→ 图表必须带直接标签或表格视图
+     · 暗色模式最差相邻 CVD ΔE = 10.3，落在 8–12 的危险区
+       → 图表必须启用次级编码（直接标签、间隙或纹理）
+     ↑ 这两条是硬性产品约束，不是审美偏好的商量项。
+   ═══════════════════════════════════════════════════════════════════════ */
+
+
+/* ══════════════ 1. 亮色模式（默认） ══════════════ */
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* — 表面与平面 — */
+  --mf-plane: #f9f9f7;            /* 页面底色 */
+  --mf-surface: #fcfcfb;          /* 卡片/图表底 */
+  --mf-raised: #ffffff;           /* 浮层、下拉 */
+
+  /* — 墨色（文字）— */
+  --mf-ink: #0b0b0b;              /* 对比度 19.2:1 */
+  --mf-ink-secondary: #52514e;    /* 7.7:1 */
+  --mf-ink-muted: #898781;        /* 3.5:1 —— 仅限大字/坐标轴标签 */
+
+  /* — 描边与图表 chrome — */
+  --mf-border: rgba(11, 11, 11, 0.1);
+  --mf-grid: #e1e0d9;             /* 图表网格线（发丝级） */
+  --mf-axis: #c3c2b7;             /* 坐标轴基线 */
+
+  /* — 品牌（蓝）—
+     取自参考调色板的蓝色阶。品牌色同时也是：
+       · 图表分类色 slot 1  · 连续色阶（热力图）· 发散色的冷极
+     三者同源，所以 UI 和图表天然协调。 */
+  --mf-brand-50: #f0f6fe;         /* UI 专用淡底（非数据色，无需校验） */
+  --mf-brand-100: #cde2fb;
+  --mf-brand-200: #9ec5f4;
+  --mf-brand-300: #6da7ec;
+  --mf-brand-400: #3987e5;
+  --mf-brand-500: #2a78d6;
+  --mf-brand-600: #256abf;
+  --mf-brand-700: #1c5cab;
+  --mf-brand-800: #184f95;
+  --mf-brand-900: #0d366b;
+
+  /* — 状态色：标记（用于色块、圆点、图表）— */
+  --mf-good: #0ca30c;
+  --mf-warning: #fab219;
+  --mf-serious: #ec835a;
+  --mf-critical: #d03b3b;
+
+  /* — 状态色：文字（WCAG AA 正文 ≥4.5:1，与标记色是两个不同角色）— */
+  --mf-good-ink: #006300;
+  --mf-warning-ink: #8a5a00;
+  --mf-serious-ink: #9a3412;
+  --mf-critical-ink: #d03b3b;
+
+  /* — 图表：8 槽分类色（固定顺序，永不循环）—
+     这个顺序本身就是 CVD 安全机制，由枚举所有排列取「最小相邻 ΔE 最大」得来。
+     不要重排。第 9 个系列不存在——超出就归入「其他」或改用小倍数图。 */
+  --chart-cat-1: #2a78d6;   /* 蓝 */
+  --chart-cat-2: #1baf7a;   /* 青 */
+  --chart-cat-3: #eda100;   /* 黄 */
+  --chart-cat-4: #008300;   /* 绿 */
+  --chart-cat-5: #4a3aa7;   /* 紫 */
+  --chart-cat-6: #e34948;   /* 红 */
+  --chart-cat-7: #e87ba4;   /* 品红 */
+  --chart-cat-8: #eb6834;   /* 橙 */
+
+  /* — 图表：发散色（蓝 ↔ 红，中性灰中点）— */
+  --chart-div-neg: #2a78d6;
+  --chart-div-mid: #f0efec;
+  --chart-div-pos: #e34948;
+
+  /* — 图表：中性 chrome — */
+  --chart-surface: #fcfcfb;
+  --chart-grid: #e1e0d9;
+  --chart-axis: #c3c2b7;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+
+/* ══════════════ 2. 暗色模式 ══════════════
+   注意：这是「重新选步」，不是把亮色值反转。
+   同一个语义角色在两种模式下可能是色阶上方向相反的步号——
+   比如成功色，亮底用深绿 #006300，暗底反而要用亮绿 #0ca30c。 */
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --mf-plane: #0d0d0d;
+    --mf-surface: #1a1a19;
+    --mf-raised: #242423;
+
+    --mf-ink: #ffffff;            /* 17.4:1 */
+    --mf-ink-secondary: #c3c2b7;  /* 9.7:1 */
+    --mf-ink-muted: #898781;      /* 4.9:1 */
+
+    --mf-border: rgba(255, 255, 255, 0.1);
+    --mf-grid: #2c2c2a;
+    --mf-axis: #383835;
+
+    /* 品牌在暗底上整体上移一档，保证 ≥3:1 */
+    --mf-brand-50: #12233d;
+    --mf-brand-100: #14304f;
+    --mf-brand-200: #184f95;
+    --mf-brand-300: #1c5cab;
+    --mf-brand-400: #3987e5;
+    --mf-brand-500: #5598e7;
+    --mf-brand-600: #6da7ec;
+    --mf-brand-700: #86b6ef;
+    --mf-brand-800: #9ec5f4;
+    --mf-brand-900: #b7d3f6;
+
+    /* 状态标记色：同一步号，在暗底上全部 ≥3:1 */
+    --mf-good: #0ca30c;
+    --mf-warning: #fab219;
+    --mf-serious: #ec835a;
+    --mf-critical: #d03b3b;
+
+    /* 状态文字色：暗底上需要更亮的步号（推导值，已验证） */
+    --mf-good-ink: #0ca30c;
+    --mf-warning-ink: #fab219;
+    --mf-serious-ink: #ec835a;
+    --mf-critical-ink: #e66767;
+
+    --chart-cat-1: #3987e5;
+    --chart-cat-2: #199e70;
+    --chart-cat-3: #c98500;
+    --chart-cat-4: #008300;
+    --chart-cat-5: #9085e9;
+    --chart-cat-6: #e66767;
+    --chart-cat-7: #d55181;
+    --chart-cat-8: #d95926;
+
+    --chart-div-neg: #3987e5;
+    --chart-div-mid: #383835;
+    --chart-div-pos: #e66767;
+
+    --chart-surface: #1a1a19;
+    --chart-grid: #2c2c2a;
+    --chart-axis: #383835;
   }
 }
 
+
+/* ══════════════ 3. 暴露给 Tailwind ══════════════
+   @theme inline 让生成的工具类直接引用上面的变量（而不是把值烤死），
+   所以系统切换深浅色时，所有 bg-* / text-* 会自动跟着变。
+
+   用法示例：
+     bg-surface        text-ink            border-hairline
+     text-good-ink     bg-good             text-brand-600
+     text-body         text-display        rounded-card            */
+
+@theme inline {
+  /* 表面 */
+  --color-plane: var(--mf-plane);
+  --color-surface: var(--mf-surface);
+  --color-raised: var(--mf-raised);
+
+  /* 墨色 */
+  --color-ink: var(--mf-ink);
+  --color-ink-secondary: var(--mf-ink-secondary);
+  --color-ink-muted: var(--mf-ink-muted);
+
+  /* 描边 */
+  --color-hairline: var(--mf-border);
+  --color-grid: var(--mf-grid);
+  --color-axis: var(--mf-axis);
+
+  /* 品牌 */
+  --color-brand-50: var(--mf-brand-50);
+  --color-brand-100: var(--mf-brand-100);
+  --color-brand-200: var(--mf-brand-200);
+  --color-brand-300: var(--mf-brand-300);
+  --color-brand-400: var(--mf-brand-400);
+  --color-brand-500: var(--mf-brand-500);
+  --color-brand-600: var(--mf-brand-600);
+  --color-brand-700: var(--mf-brand-700);
+  --color-brand-800: var(--mf-brand-800);
+  --color-brand-900: var(--mf-brand-900);
+
+  /* 状态：标记 + 文字两套 */
+  --color-good: var(--mf-good);
+  --color-warning: var(--mf-warning);
+  --color-serious: var(--mf-serious);
+  --color-critical: var(--mf-critical);
+  --color-good-ink: var(--mf-good-ink);
+  --color-warning-ink: var(--mf-warning-ink);
+  --color-serious-ink: var(--mf-serious-ink);
+  --color-critical-ink: var(--mf-critical-ink);
+
+  /* 字号阶梯
+     默认的 text-base (16px) 在正文里偏小，这里整体上调一档：
+       caption 13 · body 17 · lead 20 · title 28 · display 48 */
+  --text-caption: 0.8125rem;
+  --text-caption--line-height: 1.5;
+  --text-body: 1.0625rem;
+  --text-body--line-height: 1.7;
+  --text-lead: 1.25rem;
+  --text-lead--line-height: 1.65;
+  --text-title: 1.75rem;
+  --text-title--line-height: 1.35;
+  --text-display: 3rem;
+  --text-display--line-height: 1.15;
+
+  /* 圆角 */
+  --radius-control: 0.5rem;
+  --radius-card: 0.875rem;
+  --radius-panel: 1.25rem;
+}
+
+
+/* ══════════════ 4. 基础样式 ══════════════ */
+
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--mf-plane);
+  color: var(--mf-ink);
+  /* Geist 只含拉丁字符，中文必须显式指定兜底字体，
+     否则 Windows 上会落到宋体，观感极差。 */
+  font-family: var(--font-geist-sans), system-ui, -apple-system, "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+}
+
+/* 代码/数值列要对齐，用等宽数字 */
+code,
+pre,
+kbd {
+  font-family: var(--font-geist-mono), ui-monospace, "Cascadia Code", monospace;
 }
