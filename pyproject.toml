@@ -52,6 +52,13 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
+# RUF001/RUF002/RUF003 检测「易混淆的 Unicode 字符」，本意是防 homoglyph 攻击
+# （例如用西里尔字母 а 冒充拉丁字母 a 来伪装标识符）。
+# 但本项目的注释、文档字符串和面向用户的文案都是中文，全角标点会被它逐条误报，
+# 噪音极大而零安全收益 —— 中文标点出现在注释里不构成 homoglyph 风险。
+# 故关闭这三条，其余 RUF 规则保留。
+ignore = ["RUF001", "RUF002", "RUF003"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

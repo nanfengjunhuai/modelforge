@@ -72,7 +72,9 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router, prefix="/api")
 
-    logger.info("ModelForge %s 已装配，默认模型 provider: %s", __version__, settings.default_provider)
+    logger.info(
+        "ModelForge %s 已装配，默认模型 provider: %s", __version__, settings.default_provider
+    )
     return app
 
 
