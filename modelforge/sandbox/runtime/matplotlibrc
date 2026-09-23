@@ -1,0 +1,192 @@
+# ═══════════════════════════════════════════════════════════════════════
+# ModelForge 科研风格 —— matplotlib 的默认配置
+# ═══════════════════════════════════════════════════════════════════════
+#
+# 这个文件由 SubprocessExecutor 写进沙箱的 MPLCONFIGDIR，而 matplotlib
+# 查找配置时 `$MPLCONFIGDIR/matplotlibrc` 排在**第一位**。所以：
+#
+#     沙箱里任何 matplotlib 代码都会自动套上这套风格，
+#     **不需要模型调用任何东西，也不依赖提示词。**
+#
+# 这是刻意的设计。指望模型每次都记得调我们的辅助函数是不现实的 ——
+# 它忘了不会报错，只会安静地出一张宋体豆腐块，而你会以为是 matplotlib 的锅。
+# 风格必须由环境保证，辅助模块（modelforge_plot.py）只负责让它「更好」。
+#
+# ───────────────────────────────────────────────────────────────────────
+# 目标：数学建模论文里的插图
+# ───────────────────────────────────────────────────────────────────────
+#
+# 数模国赛的论文是 Word/PDF，图会被缩到 8~16cm 宽，**而且经常被黑白打印**。
+# 所以这套配置服务于三个目标，按重要性排序：
+#
+#   ① 中文字能显示、负号不变豆腐块
+#   ② 缩到一半大小之后仍然清楚（字号不能跟着纸面尺寸走，要按成品尺寸定）
+#   ③ 打印出来能区分系列（颜色之外必须有别的编码 —— 见 modelforge_plot.style_lines）
+#
+# 色值来自 web/src/app/globals.css 的 --chart-cat-*（ADR-006：UI 与图表
+# 共用一套色彩体系）。两边的值由 tests/test_palette_contract.py 强制一致 ——
+# 改这里不改那里，CI 会红。
+
+# ── 字体 ────────────────────────────────────────────────────────────────
+#
+# 中文黑体 + 西文无衬线。把中文字体排在**最前面**是刻意的：这样中文和
+# 西文由同一个字体渲染，整张图的字重和字面高度是一致的。只在最后放
+# DejaVu Sans 兜底 —— 它是 matplotlib 自带的，保证任何机器上都至少有字可显示。
+#
+# ⚠️ 字体名写错**不会报错**，matplotlib 只会沉默地换一个字体，然后中文
+# 全变成方框。改这个列表之后请务必真的画一张带中文的图看看。
+font.family:      sans-serif
+font.sans-serif:  Noto Sans SC, Microsoft YaHei, SimHei, Source Han Sans SC, DejaVu Sans
+font.monospace:   DejaVu Sans Mono, Consolas, monospace
+
+# ★ 这一行不设，坐标轴上的负号会变成豆腐块。
+#   原因很绕：matplotlib 默认用 Unicode 的「减号」（U+2212）而不是 ASCII 的
+#   连字符，而绝大多数中文字体里没有 U+2212 这个字形。设成 False 之后
+#   它退回用 ASCII 的 '-'，所有字体都有。
+axes.unicode_minus: False
+
+# ── 尺寸与分辨率 ────────────────────────────────────────────────────────
+#
+# figsize 按**成品尺寸**定，不是按屏幕看着舒服定：
+#   6.3in ≈ 16cm，正好是 A4 去掉页边距后的正文宽度（双栏论文的单栏约 8cm，
+#   双栏通栏约 16cm）。模型按这个尺寸画，贴进论文里基本不用缩放。
+#
+# figure.dpi 只影响交互显示的窗口大小（沙箱里是 Agg 后端，没有窗口，
+# 所以它其实不生效）；真正决定成品的是 savefig.dpi。
+figure.figsize:   6.3, 4.0
+figure.dpi:       120
+savefig.dpi:      300
+savefig.bbox:     tight
+savefig.pad_inches: 0.02
+
+# ── 投稿必需的字体嵌入 ──────────────────────────────────────────────────
+#
+# ★ 42 = TrueType。matplotlib 默认用 Type 3，而**很多期刊的投稿系统会直接
+#   拒收含 Type 3 字体的 PDF**（Type 3 是位图字体，放大后是糊的）。
+#   42 让字体以 TrueType 子集的方式嵌进去，缩放不失真。
+#
+# 这条对数模国赛用不上（那边交 Word），但只要用户想把图放进 LaTeX 或者
+# 投个期刊，它就是「能不能用」的区别，而代价是两行配置。
+pdf.fonttype:     42
+ps.fonttype:      42
+
+# ── 去装饰 ──────────────────────────────────────────────────────────────
+#
+# 顶边和右边的框线不承载任何信息，去掉之后数据区域更大、更像论文插图。
+# 这是学术图表和「BI 仪表盘」在视觉上最明显的分界。
+axes.spines.top:    False
+axes.spines.right:  False
+axes.linewidth:     0.8
+
+# 网格保留但压到极淡，且必须在数据**下面**。
+# 不加 axisbelow 的话网格线会盖在柱子上，看起来很脏。
+axes.grid:          True
+axes.axisbelow:     True
+# ⚠️ 颜色值**必须加引号**。不加的话 `#` 会被当成行内注释的开头，
+#    于是这一行变成「grid.color: 空值」—— 而这**不报错**，只是静默失效，
+#    网格还是 matplotlib 默认的灰色。
+grid.color:         "#e1e0d9"
+grid.linewidth:     0.6
+grid.linestyle:     -
+
+# ── 字号 ────────────────────────────────────────────────────────────────
+#
+# 按「缩到 16cm 宽之后仍然清楚」来定。10.5pt 的正文配 9.5pt 的刻度，
+# 是个偏小但不会被缩没的组合 —— 论文插图的惯例。
+font.size:          10.5
+axes.titlesize:     11
+axes.labelsize:     10.5
+xtick.labelsize:    9.5
+ytick.labelsize:    9.5
+legend.fontsize:    9.5
+
+# 刻度朝外、短一点。朝内的刻度会和数据线打架。
+xtick.direction:    out
+ytick.direction:    out
+xtick.major.size:   3.0
+ytick.major.size:   3.0
+xtick.major.width:  0.8
+ytick.major.width:  0.8
+xtick.minor.size:   1.6
+ytick.minor.size:   1.6
+
+# ── 线与标记 ────────────────────────────────────────────────────────────
+#
+# 1.4pt 的线宽在缩到一半之后仍然看得见；再细就会在打印时断断续续。
+lines.linewidth:    1.4
+lines.markersize:   4.5
+lines.solid_capstyle: round
+patch.linewidth:    0.8
+patch.edgecolor:    none
+patch.force_edgecolor: False
+
+# ── 图例 ────────────────────────────────────────────────────────────────
+#
+# 不要边框。图例框会把本来就紧张的数据区域再框掉一块，
+# 而且论文里通常直接靠线型和标签对应，不需要那个框。
+legend.frameon:     False
+legend.handlelength: 1.6
+legend.handletextpad: 0.6
+legend.borderaxespad: 0.4
+legend.labelspacing: 0.35
+
+# ── 布局 ────────────────────────────────────────────────────────────────
+#
+# 有多个子图时自动排开，避免刻度和标签互相压。
+#
+# ⚠️ 前缀是 `figure.subplot.`，不是 `subplot.`。
+#    `subplot.left` 这种写法在旧版 matplotlib 里曾经能用，现在会被判为
+#    bad key —— 而且它**只往 stderr 打一行警告就过去了**，配置静默失效。
+#    这类「配置写错了但程序照跑」的情况是 M5 里最花时间的一类问题，
+#    所以判据不能是「没报错」，得是「读回来确认值对了」。
+figure.constrained_layout.use: False
+figure.subplot.left:   0.11
+figure.subplot.right:  0.97
+figure.subplot.bottom: 0.13
+figure.subplot.top:    0.93
+figure.subplot.wspace: 0.25
+figure.subplot.hspace: 0.25
+
+# ── 分类色循环 ──────────────────────────────────────────────────────────
+#
+# 就是 globals.css 里那 8 个 --chart-cat-*（亮色模式的值）。
+#
+# ⚠️ **顺序本身就是 CVD 安全机制**，由枚举所有排列、取「最小相邻色差最大」
+#    得来，不是随便排的。不要重排，也不要往后追加第 9 个颜色 ——
+#    设计系统的结论是「第 9 个系列不存在」，超出就归入「其他」或改用小倍数图。
+#
+# ⚠️ 这是论文**打印**用的调色板，所以取亮色模式那组。暗色模式那组是给
+#    屏幕看的，印在纸上对比度不够。
+#
+# 两条硬性约束（用 validate_palette.js 算出来的，不是估计）：
+#   · 亮色模式有 3 个色对比度低于 3:1 → 图必须带直接标签或表格
+#   · 暗色模式最差相邻 CVD ΔE = 10.3，落在危险区 → 必须启用次级编码
+# 合起来：**图表永远不能只靠颜色区分系列。** 黑白打印是数模论文的常态，
+# 所以 modelforge_plot.style_lines() 会给每条线再叠一层线型和标记形状的区分。
+# ══════════════════════════════════════════════════════════════════════
+# ⚠️⚠️ 这一行有两个非常容易踩、而且**都只静默失效**的坑，别动它
+# ══════════════════════════════════════════════════════════════════════
+#
+# 坑一：写法必须是 `cycler(color=[...])`（关键字参数），不能是
+#       `cycler('color', [...])`。后者不是合法的 cycler 构造。
+#
+# 坑二（更隐蔽）：**里面那层颜色的引号必须是双引号。**
+#
+#   matplotlib 读 rc 文件时用 `cbook._strip_comment()` 砍行内注释，
+#   而它**只认双引号**：
+#
+#       quote_pos = s.find('"', pos)     # ← 只看双引号，不看单引号
+#       if quote_pos < 0: return s[:hash_pos]   # 没有双引号就照砍
+#
+#   所以 `['#2a78d6', ...]` 里的 `#` 会被当成注释开头，整个值被截成
+#   `cycler(color=['`，解析失败 → **matplotlib 悄悄退回默认的 tab10 配色**。
+#   图照出，只是颜色全错（那张图会是 matplotlib 的老配色，不是设计系统这套），
+#   而不看 stderr 的话你根本不会知道。
+#
+#   换成双引号之后 `#` 落在引号里，`_strip_comment` 就会跳过它。
+#   上面 `grid.color` 那行外面套双引号是同一个道理 —— matplotlib 自带的
+#   模板里写 `#grid.color: "#b0b0b0"` 也是因为这个。
+#
+# 「改配置之后要**把值读回来确认**，而不是看有没有报错」——
+# tests/test_palette_contract.py 就是这条经验的产物。
+axes.prop_cycle: cycler(color=["#2a78d6", "#1baf7a", "#eda100", "#008300", "#4a3aa7", "#e34948", "#e87ba4", "#eb6834"])

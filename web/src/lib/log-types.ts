@@ -22,6 +22,8 @@
  *   ② 下面的判别联合会让 `switch` 有穷尽性检查。
  */
 
+import type { ArtifactRef } from './stream-types'
+
 /** 一条 OpenAI 格式的消息，**原样**存进日志。 */
 export type LoggedMessage = {
   role: string
@@ -38,7 +40,7 @@ export type LoggedToolCall = {
   function: { name: string; arguments: string }
 }
 
-/** 一次工具执行的结果 —— 给界面回放用（stdout / 耗时 / 退出码）。 */
+/** 一次工具执行的结果 —— 给界面回放用（stdout / 耗时 / 退出码 / 产物）。 */
 export type LoggedToolResult = {
   call_id: string
   name: string
@@ -49,6 +51,20 @@ export type LoggedToolResult = {
   duration_ms: number
   timed_out: boolean
   error: string | null
+  /**
+   * 这次执行产出的文件（M5 新增）。
+   *
+   * ⚠️ **它和 `stream-types.ts` 里的 `ToolResultEvent` 是同一份数据的两种写法**
+   * —— 那边是流事件（带 `type` 判别子），这边是日志记录（藏在 `tool` 事件的
+   * `result` 字段里，没有判别子）。字段必须一个一个对得上，
+   * `tests/test_event_contract.py` 盯着这件事。
+   *
+   * 产物的元数据**没有单独的存储**，它跟着这条记录一起进了事件日志。
+   * 于是「刷新页面之后图还在」不需要任何额外机制 —— 重建界面读的就是这份
+   * 记录，产物引用顺手就回来了。这是 M4 把 `ToolResult` 原样存进日志的
+   * 顺带好处，M5 只是用上了它。
+   */
+  artifacts: ArtifactRef[]
 }
 
 // ══════════════════════════════════════════════════════ 七种记录

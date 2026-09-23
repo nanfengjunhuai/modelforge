@@ -65,7 +65,7 @@ class _ScriptedProvider:
 class _FakeExecutor:
     name = "fake"
 
-    async def run(self, code: str, *, timeout: float | None = None):
+    async def run(self, code: str, *, timeout: float | None = None, scope: str | None = None):
         from modelforge.sandbox.base import ExecutionResult
 
         return ExecutionResult(stdout="5050\n", exit_code=0, duration_ms=3)

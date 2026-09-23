@@ -62,6 +62,9 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+# 和 api/artifacts.py 同样的理由：取产物存储要**运行时查模块属性**，
+# 否则 tests/conftest.py 的 monkeypatch 罩不住这里，测试会写进真实目录。
+from modelforge import artifacts as artifact_store_pkg
 from modelforge.agents.loop import run_agent_turn
 from modelforge.api.chat import acquire_provider, format_sse, get_executor
 from modelforge.config import get_settings
@@ -238,6 +241,10 @@ def _stream_response(
                 executor=get_executor(),
                 recorder=SessionRecorder(store, session_id),
                 tools=SESSION_TOOL_SPECS,
+                # 模型生成的图归到这个会话名下（M5）。会话这一层是唯一
+                # 知道「这些产物该跟着谁走」的地方，所以 scope 从这里给出去，
+                # 经 loop、dispatch 一路传到 executor。
+                scope=session_id,
             ):
                 yield format_sse(event)
 
@@ -310,9 +317,37 @@ async def get_session(session_id: str) -> SessionDetail:
 
 @router.delete("/{session_id}", summary="删除会话")
 async def delete_session(session_id: str) -> dict[str, bool]:
-    deleted = await get_store().delete(session_id)
+    """删除会话，**连同它的产物**。
+
+    两件事必须一起做，否则会留下一堆谁也不认识的图：日志没了，
+    那些产物的引用就没了，界面上再也看不到它们，而磁盘上还在占着地方。
+    这是「孤儿产物」两种来源里的第一种（另一种是进程被强杀，
+    由 `main.py` 启动时清理）。
+
+    ⚠️ 顺序是**先删会话再删产物**，而且删产物失败**不让整个请求失败**。
+
+    为什么是这个顺序：`store.delete()` 可能返回 False（会话不存在），
+    那时候我们已经把图删了 —— 但那种情况下本来也没人会来取它们。
+    反过来先删产物再删会话的话，删会话失败会留下一堆「日志里记着有产物、
+    盘上却没有」的引用，那是更糟的状态：用户点开图会拿到 404，
+    而界面上明明画着一张缩略图。
+
+    产物删不掉（Windows 上浏览器正开着那张图，句柄没释放）时只记一笔日志。
+    用户的意图是「删掉这个会话」，会话确实删掉了；
+    剩下的目录会在下次启动时被 `sweep_orphans()` 收走。
+    """
+    store = get_store()
+    deleted = await store.delete(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"没有这个会话：{session_id}")
+
+    try:
+        removed = await artifact_store_pkg.get_store().delete_scope(session_id)
+        if removed:
+            logger.info("已删除会话 %s 的 %d 个产物", session_id, removed)
+    except Exception:
+        logger.warning("删除会话产物失败（下次启动会清理）", exc_info=True)
+
     return {"deleted": True}
 
 

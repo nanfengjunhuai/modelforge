@@ -29,8 +29,12 @@ from pathlib import Path
 import pytest
 
 from modelforge.config import Settings
+
+# PROJECT_ROOT / is_inside 在 M5 被收拢进了 modelforge/paths.py ——
+# 以前它们住在 subprocess_exec 里，而 PROJECT_ROOT 在两个模块里各定义了一份。
+from modelforge.paths import PROJECT_ROOT, is_inside
 from modelforge.sandbox.base import ExecutionResult
-from modelforge.sandbox.subprocess_exec import PROJECT_ROOT, SubprocessExecutor, _is_inside
+from modelforge.sandbox.subprocess_exec import SubprocessExecutor
 
 
 def _executor(tmp_path: Path, *, max_output: int, name: str) -> SubprocessExecutor:
@@ -305,7 +309,7 @@ def test_default_work_dir_is_outside_the_project():
     """
     executor = SubprocessExecutor(settings=Settings(sandbox_python=Path(sys.executable)))
 
-    assert not _is_inside(executor.work_root, PROJECT_ROOT), (
+    assert not is_inside(executor.work_root, PROJECT_ROOT), (
         f"默认工作目录 {executor.work_root} 落在项目里，"
         "会让 uvicorn --reload 反复触发重载"
     )

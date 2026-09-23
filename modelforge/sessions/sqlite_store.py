@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from modelforge.config import Settings, get_settings
+from modelforge.paths import resolve_project_path
 from modelforge.providers.base import Message
 from modelforge.providers.events import DecisionRequest, ToolResult
 from modelforge.sessions.base import (
@@ -76,9 +77,6 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["SessionRecorder", "SqliteSessionStore", "resolve_db_path"]
 
-# 项目根目录。<root>/modelforge/sessions/sqlite_store.py 往上数三级。
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
 T = TypeVar("T")
 
 
@@ -86,14 +84,14 @@ def resolve_db_path(settings: Settings) -> Path:
     """把配置里的数据库路径解析成绝对路径，**锚在项目根目录上**。
 
     为什么不按当前工作目录（CWD）？因为 CWD 是不可靠的 —— 用户可能从任何
-    地方敲启动命令。`subprocess_exec.py` 的 `_resolve()` 早就为沙箱定下了
-    这条规矩（那里的注释写着「CWD 是不可靠的」），这里是同一个问题。
+    地方敲启动命令。同一套规矩在沙箱那边也定过一次，M5 把两者收进了
+    `modelforge/paths.py`（那里把「项目内的东西锚项目根」和「运行时生成的
+    东西落系统目录」这两条反向的规则写在了一起）。
 
     ⚠️ 两套约定并存一定会有人踩：在 `web/` 目录下启动后端，得到一个空数据库，
     然后开始怀疑为什么「会话列表是空的但刷新也没用」。统一按 PROJECT_ROOT。
     """
-    path = Path(settings.database_path)
-    return path if path.is_absolute() else PROJECT_ROOT / path
+    return resolve_project_path(Path(settings.database_path))
 
 
 _SCHEMA = """

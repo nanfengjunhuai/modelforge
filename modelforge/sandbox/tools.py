@@ -64,13 +64,55 @@ RUN_PYTHON_SPEC: ToolSpec = {
             "环境里预装了 numpy、scipy、matplotlib 和标准库。"
             "不要假设能 pip install 新包，也不要依赖网络访问。\n"
             "\n"
-            "三条必须记住的规则：\n"
+            "【三条必须记住的规则】\n"
             "1. **只有 print() 输出的内容会回到你手上**，表达式的值和 return 都不会。"
             "所以每一步中间结果都要显式打印出来，并带上标签（比如 print('均值:', mu)）。\n"
             "2. **每次调用都是一个全新的空目录**，上一次调用写的文件读不到了。"
             "需要跨调用保留的数据，就把它打印出来，从对话里带过去。\n"
             "3. matplotlib 用的是 Agg 后端，**没有窗口，plt.show() 不会显示任何东西**。"
-            "要出图就 plt.savefig('chart.png')，然后告诉我文件名。\n"
+            "出图看下一节。\n"
+            "\n"
+            "【出图：用户要的是能直接贴进论文的图】\n"
+            "\n"
+            "工作目录里已经放好了一个绘图模块，**出图一律用它**：\n"
+            "\n"
+            "    import modelforge_plot as mp\n"
+            "\n"
+            "    fig, ax = plt.subplots()\n"
+            "    ...画你的图...\n"
+            "    mp.save(fig, \"三种赋权方法的权重对比\")\n"
+            "\n"
+            "**不要用 plt.savefig()。** 自己存的文件会落在工作目录根下，"
+            "而那个目录在这次执行结束时会被整个删掉 —— 图就没了，用户什么也看不到。"
+            "只有存进 `artifacts/` 目录（`mp.save()` 替你做了这件事）的文件才会被保留。\n"
+            "\n"
+            "`mp.save()` 会自动做好论文需要的一切：\n"
+            "  · 中文黑体、去掉顶部和右侧边框、淡网格、无框图例 —— 科研风格已经默认生效，"
+            "你不用手动调 rcParams\n"
+            "  · 同时输出 300 dpi 的 PNG（贴 Word 用）和矢量 PDF（投期刊用，字体已嵌入）\n"
+            "  · 颜色自动取设计好的分类色板，**不要自己指定十六进制色值**\n"
+            "\n"
+            "**多条曲线时，画完调一次 `mp.style_lines(ax)`。** 它会按系列分配不同的"
+            "线型和标记形状 —— 数模论文经常被黑白打印，那时颜色区分度归零，"
+            "只有线型和标记还能把曲线分开。\n"
+            "\n"
+            "**能出图的时候一定要出图。** 数模论文里图是最要紧的产出之一，"
+            "把结果画出来比在正文里堆一段数字有用得多。\n"
+            "\n"
+            "【顺手把图的数据也交出来】\n"
+            "\n"
+            "`mp.save()` 还有一个可选的 `chart=` 参数，用来存**这张图背后的数据**，"
+            "用户可以在界面上悬停查看具体数值：\n"
+            "\n"
+            "    mp.save(fig, \"权重对比\", chart={\n"
+            "        \"kind\": \"bar\",\n"
+            "        \"series\": [{\"name\": \"熵权法\", \"data\": w} for ...],\n"
+            "        \"categories\": labels,\n"
+            "    })\n"
+            "\n"
+            "⚠️ `data` 里必须是你**算出来的真实数组**，不能凭印象重新打一遍数字。"
+            "这个参数存在的全部意义就是让图和数字同源，手打就失去意义了。"
+            "写歪了不影响图片本身，只会少一份可交互数据 —— 但那就白画了。\n"
             "\n"
             "代码写错了没关系，报错信息（traceback）会完整回到你手上，你可以据此改。"
         ),
@@ -192,17 +234,25 @@ def _require_code(args: dict[str, Any]) -> str:
 
 # 工具名 → (参数校验与执行)。加新工具时：写一个这样的函数，
 # 再往 RUN_PYTHON_SPEC 旁边加一份 ToolSpec，注册到这个表里。
-_HANDLERS: dict[str, Callable[[dict[str, Any], CodeExecutor], Awaitable[ExecutionResult]]] = {}
+#
+# 第三个参数是 `scope`（产物归属，M5 加）。它从 `dispatch` 一路传下来，
+# 最终交给 `executor.run()` —— 无状态端点传 None，表示「产物不用留」。
+_Handler = Callable[[dict[str, Any], CodeExecutor, "str | None"], Awaitable[ExecutionResult]]
+_HANDLERS: dict[str, _Handler] = {}
 
 
-async def _handle_run_python(args: dict[str, Any], executor: CodeExecutor) -> ExecutionResult:
-    return await executor.run(_require_code(args))
+async def _handle_run_python(
+    args: dict[str, Any], executor: CodeExecutor, scope: str | None
+) -> ExecutionResult:
+    return await executor.run(_require_code(args), scope=scope)
 
 
 _HANDLERS["run_python"] = _handle_run_python
 
 
-async def _handle_ask_user(args: dict[str, Any], executor: CodeExecutor) -> ExecutionResult:
+async def _handle_ask_user(
+    args: dict[str, Any], executor: CodeExecutor, scope: str | None
+) -> ExecutionResult:
     """永远不会被正常调用到的处理器。
 
     存在两个理由，都不是「以防万一」这么含糊：
@@ -288,7 +338,9 @@ def build_decision_request(call: ToolCall) -> DecisionRequest:
 # ══════════════════════════════════════════════════════ 派发
 
 
-async def dispatch(call: ToolCall, *, executor: CodeExecutor) -> ToolResult:
+async def dispatch(
+    call: ToolCall, *, executor: CodeExecutor, scope: str | None = None
+) -> ToolResult:
     """执行一个工具调用，**永不抛异常**。
 
     任何失败都被折叠成一个 `ok=False` 的 ToolResult —— 包括「工具名不认识」
@@ -300,6 +352,8 @@ async def dispatch(call: ToolCall, *, executor: CodeExecutor) -> ToolResult:
     Args:
         call: M1 拼装好的工具调用，`arguments` 是未解析的 JSON 字符串。
         executor: 代码执行后端。
+        scope: 这次调用产出的文件归属谁（会话 id）。`None` 表示不保留产物
+            —— 无状态端点走的就是这条。定义见 `CodeExecutor.run`。
     """
     started = time.monotonic()
 
@@ -331,7 +385,7 @@ async def dispatch(call: ToolCall, *, executor: CodeExecutor) -> ToolResult:
 
     # ③ 逐字段校验 + 执行
     try:
-        result = await _HANDLERS[call.name](args, executor)
+        result = await _HANDLERS[call.name](args, executor, scope)
     except BadArguments as exc:
         return fail(str(exc))
     except Exception as exc:
@@ -352,6 +406,9 @@ async def dispatch(call: ToolCall, *, executor: CodeExecutor) -> ToolResult:
         duration_ms=result.duration_ms,
         timed_out=result.timed_out,
         error=result.error,
+        # 产物引用直接带上去 —— 它会被原样存进事件日志，所以刷新页面之后
+        # 图还在。见 `ToolResult.artifacts` 的说明。
+        artifacts=result.artifacts,
     )
 
 
@@ -397,4 +454,30 @@ def format_for_model(result: ToolResult) -> str:
     elif result.exit_code not in (0, None):
         parts.append(f"【进程以非零退出码 {result.exit_code} 结束】")
 
+    if result.artifacts:
+        # 把产物列给模型看，有两个具体用处：
+        #   ① 它能照着这些文件名回答用户（「我画了一张《权重对比》，你可以点开看」），
+        #      而不是含糊地说「图已经生成了」；
+        #   ② 它知道自己这次确实产出了东西，下一轮就不会重复画同一张图。
+        #
+        # 这段文字会被**冻结**进事件日志（见 `loop._tool_message`），
+        # 所以改措辞不会追溯性地改写历史会话里模型当时看到的内容。
+        lines = [
+            f"  · {item.name}（{item.kind}，{_human_size(item.size)}）"
+            for item in result.artifacts
+        ]
+        parts.append(
+            "【已保存的产物】下面这些文件已经存好，用户可以在界面上看到并下载。"
+            "你可以在回答里提到它们：\n" + "\n".join(lines)
+        )
+
     return "\n\n".join(parts)
+
+
+def _human_size(size: int) -> str:
+    """把字节数变成人看得懂的写法。模型和用户都会读这段文字。"""
+    if size < 1024:
+        return f"{size} 字节"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.0f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"

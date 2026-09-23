@@ -59,6 +59,27 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 # 故关闭这三条，其余 RUF 规则保留。
 ignore = ["RUF001", "RUF002", "RUF003"]
 
+[tool.mypy]
+# ⚠️ 沙箱运行时目录**刻意排除在 mypy 之外**，这不是偷懒。
+#
+# `modelforge/sandbox/runtime/` 里的代码不在后端进程里跑 —— 它会被复制进
+# 沙箱的临时工作目录，由 `.venv-sandbox` 的 python 执行。而那个环境里装的
+# 是 numpy / matplotlib，后端 `.venv` 里**刻意没有**它们（ADR-005 的安全边界，
+# 见上面 dependencies 的注释）。
+#
+# 所以拿后端的 mypy 去检查它必然报 "Cannot find implementation or library
+# stub for module named 'matplotlib'" —— 这个报错**不说明任何真实问题**，
+# 只说明「检查器站在了错误的环境里」。
+#
+# 它真正的验收方式是「在沙箱里真的跑一遍」，见 tests/test_matplotlib_style.py。
+# 那条路径能抓到 mypy 抓不到的东西：M5 开发过程中它抓到过 numpy 数组被
+# 误判成非法输入，以及 matplotlibrc 里 7 个静默失效的配置项 ——
+# 后者一个类型检查器都抓不到，因为「配置写错了但程序照跑」根本不是类型问题。
+#
+# ruff 仍然检查这个文件（它只做语法和风格），所以不是完全无人看守。
+exclude = ['^modelforge/sandbox/runtime/']
+
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

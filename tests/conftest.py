@@ -1,9 +1,10 @@
 """所有测试共享的夹具。
 
-两件事，都是「默认安全」：
+三件事，都是「默认安全」：
 
   ① 会话存储指到临时目录（否则测试会写进项目里的真实数据库）
-  ② 每个测试前后清空 Provider 缓存（否则假 Provider 会在测试之间泄漏）
+  ② 产物存储指到临时目录（否则测试会在你的用户目录里堆一堆图）
+  ③ 每个测试前后清空 Provider 缓存（否则假 Provider 会在测试之间泄漏）
 """
 
 from __future__ import annotations
@@ -12,7 +13,9 @@ from pathlib import Path
 
 import pytest
 
+from modelforge import artifacts as artifacts_package
 from modelforge.api import chat, sessions
+from modelforge.artifacts.local_store import LocalArtifactStore
 from modelforge.config import Settings
 from modelforge.sessions.sqlite_store import SqliteSessionStore
 
@@ -62,4 +65,38 @@ def isolated_session_store(
     # 替换模块属性而不是实例方法 —— main.py 里写的是 `sessions.get_store()`，
     # 也就是「运行时去那个模块上取这个名字」。所以换掉模块属性就能生效。
     monkeypatch.setattr(sessions, "get_store", lambda: store)
+    return store
+
+
+@pytest.fixture(autouse=True)
+def isolated_artifact_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> LocalArtifactStore:
+    """产物存储落到 `tmp_path`，绝不碰你的用户目录。
+
+    ════════════════════════════════════════════════════════════════
+    为什么这条比以前那条（会话存储）更要紧
+    ════════════════════════════════════════════════════════════════
+    M4 之前，测试最坏也就是写脏 `data/modelforge.db` —— 那好歹在项目里，
+    删掉就行。产物的默认位置是**系统应用数据目录**
+    （`%LOCALAPPDATA%\\modelforge\\artifacts`），也就是你自己的用户目录。
+
+    没有这个夹具的话，最坏情况不是「堆一堆没用的 PNG」，而是**删掉你真实的图**：
+
+        main.py 的 lifespan 启动时会调 `sweep_orphans()`，把「不属于任何
+        现存会话」的产物目录删掉。而测试里的会话存储是空的 ——
+        于是一次测试运行，会把用户**所有**真实的产物目录当成孤儿删光。
+
+    这条路径只有在「测试真的跑了 lifespan」时才走到，也就是
+    `TestClient(create_app())` 那几个夹具 —— 而它们恰恰是端到端测试用的。
+    这正是 M4 那条「测试会跑 lifespan，而启动钩子会清租约」的同款问题：
+    **测试的副作用发生在它正在测的那条路径之外，而且测试依然全绿。**
+
+    ⚠️ 另有一条约束配套：`main.py` / `api/artifacts.py` / `api/sessions.py`
+       取产物存储时必须写 `artifact_store_pkg.get_store()`（运行时查属性），
+       不能写 `from modelforge.artifacts import get_store`（导入时绑定）——
+       后者是绑死的函数对象，这里换不掉。三个文件里都写了注释说明。
+    """
+    store = LocalArtifactStore(settings=Settings(artifacts_dir=tmp_path / "artifacts"))
+    monkeypatch.setattr(artifacts_package, "get_store", lambda: store)
     return store

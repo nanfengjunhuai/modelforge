@@ -101,6 +101,35 @@ export type ErrorEvent = {
 }
 
 /**
+ * 产物的**大类**。界面据此决定画成缩略图还是一个下载链接。
+ *
+ * 只分四个而不是直接用 MIME：MIME 太细了，前端要为 `image/svg+xml` 和
+ * `image/png` 写两遍一模一样的分支。这一层是**给界面看的提示**，
+ * 不是安全判断 —— 猜错了只会让某张图显示成一个链接。
+ */
+export type ArtifactKind = 'image' | 'data' | 'document' | 'other'
+
+/**
+ * 一个已落盘的产物（M5 新增）—— 模型的代码画出来的一张图、一份 CSV。
+ *
+ * ⚠️ **注意这里没有文件系统路径，而且是刻意的。** 后端那边有意识地
+ * 把这个模型和「带 path 的暂存文件」分成两个类型（见 `artifacts/base.py`），
+ * 让「带路径的东西」在类型层面就不可能流到浏览器。
+ *
+ * 取文件走 `GET /api/artifacts/{session_id}/{id}`，见 `lib/sessions.ts`
+ * 的 `artifactUrl()`。
+ */
+export type ArtifactRef = {
+  id: string
+  /** 模型起的名字（可能是中文）。**磁盘上不是这个名字** —— 那边是 uuid。 */
+  name: string
+  kind: ArtifactKind
+  mime: string
+  /** 字节数。 */
+  size: number
+}
+
+/**
  * 一次工具执行的结果。
  *
  * ⚠️ 这是唯一一个**不是模型发出来的**事件 —— 它是后端跑完代码之后自己造的。
@@ -124,6 +153,11 @@ export type ToolResultEvent = {
   duration_ms: number
   timed_out: boolean
   error: string | null
+  /**
+   * 这次执行产出的文件（M5 新增）。没有产物时是空数组，不是 undefined ——
+   * 后端那边是个带 `default_factory` 的列表字段，永远会给。
+   */
+  artifacts: ArtifactRef[]
 }
 
 /**

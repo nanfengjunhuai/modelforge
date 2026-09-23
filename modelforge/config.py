@@ -12,6 +12,8 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from modelforge.paths import user_data_dir
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -57,8 +59,23 @@ class Settings(BaseSettings):
     **改了 `agent_max_tool_rounds` 或 `sandbox_timeout` 要回头看这个值。**
     """
 
-    # Agent 产物（图表、生成的报告、沙箱输出）落盘的根目录
-    artifacts_dir: Path = Path("artifacts")
+    artifacts_dir: Path = user_data_dir() / "artifacts"
+    """模型生成的产物（图表、CSV、报告）落盘的根目录。
+
+    ⚠️ **默认值刻意在项目目录之外，不要随手改回 `artifacts/`。**
+
+    这里踩过一个 M3 已经踩过一次的坑，形态一模一样但更难发现：
+    uvicorn 的 `--reload` 盯着整个项目目录。产物一落盘，热重载就被触发，
+    而重载发出的终止信号会顺着控制台传到**正在跑代码的沙箱子进程**上 ——
+    模型会时不时收到一个莫名其妙的 `KeyboardInterrupt`（退出码 3221225786）。
+
+    为什么说「更难发现」：这个坑在 M3 是每次执行写一个 `solution.py`
+    触发的（每次都中），而产物是**只有画图时**才落盘 —— 于是它看起来
+    像「模型偶尔抽风」，尤其是画图那几轮。竞态 + 低频 = 最难查的组合。
+
+    详见 `sandbox/subprocess_exec.py` 模块注释的「⑤」，以及
+    `modelforge/artifacts/local_store.py` 里那条启动警告。
+    """
 
     # ---------- 模型 Provider ----------
     # M1 会基于下面这些字段构建 Provider 抽象层。
@@ -103,6 +120,27 @@ class Settings(BaseSettings):
 
     放在系统临时目录就完全避开了这个问题。想改的话，
     执行器会在启动时检查并在目录落进项目里时打出警告。
+    """
+
+    sandbox_mpl_config_dir: Path = user_data_dir() / "mplconfig"
+    """沙箱里 matplotlib 的配置目录（`MPLCONFIGDIR`）。M5 新增。
+
+    ⚠️ **必须是持久目录，不能是每次执行都删的工作目录。**
+
+    这里修的是一个真实的性能问题：M3 把 `MPLCONFIGDIR` 设成了
+    `<工作目录>/.mplconfig`，而工作目录在每次执行结束时被整个删掉。
+    后果是**每一次 `import matplotlib.pyplot` 都要重建字体缓存** ——
+    在这台机器上（273 个字体）是秒级的固定开销。
+
+    M3 看不出问题（那次执行总共才 155ms，多花的钱在噪声里），
+    但 M5 是图表密集的：画一张图就交一次这个税，而 `sandbox_timeout`
+    默认只有 10 秒 —— 画三张图很可能直接撞超时，报错还长得像
+    「你的代码太慢」，完全指不到真正的原因。
+
+    这个目录同时承担第二个职责：**放我们的 `matplotlibrc`**。
+    matplotlib 查找配置的顺序里，`$MPLCONFIGDIR/matplotlibrc` 排在第一位，
+    所以放在这里意味着沙箱里**任何** matplotlib 代码都会自动套上科研风格，
+    不需要模型配合（见 `sandbox/runtime/matplotlibrc`）。
     """
 
     agent_max_tool_rounds: int = 5

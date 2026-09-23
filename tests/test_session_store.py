@@ -17,12 +17,17 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 from modelforge.config import Settings
+
+# PROJECT_ROOT 在 M5 被收拢进了 modelforge/paths.py（它以前在
+# subprocess_exec 和 sqlite_store 里各定义了一份）。
+from modelforge.paths import PROJECT_ROOT
 from modelforge.providers.events import ToolResult
 from modelforge.sessions.base import (
     LogAssistant,
@@ -35,7 +40,6 @@ from modelforge.sessions.base import (
 )
 from modelforge.sessions.project import derive_status, derive_title
 from modelforge.sessions.sqlite_store import (
-    PROJECT_ROOT,
     SessionRecorder,
     SqliteSessionStore,
     resolve_db_path,
@@ -238,6 +242,62 @@ async def test_deleting_a_session_also_removes_its_events(store: SqliteSessionSt
     with sqlite3.connect(store.path) as raw:
         remaining = raw.execute("SELECT COUNT(*) FROM events").fetchone()[0]
     assert remaining == 0
+
+
+async def test_events_written_before_m5_still_load(store: SqliteSessionStore):
+    """**向后兼容：M5 之前落盘的 `tool` 事件里没有 `artifacts` 字段。**
+
+    这条测试看着像在测一个不存在的情况，其实测的是**用户真实的历史数据**。
+    `ToolResult` 在 M5 加了 `artifacts` 之后，数据库里那些 M4 时期写下的
+    payload 里根本没有这个键。读回来时它会靠 Pydantic 的
+    `default_factory=list` 补成空列表 —— 于是前端拿到的永远是数组，
+    `result.artifacts.length` 不会炸。
+
+    ⚠️ **这件事目前是「默认值处理的顺带结果」，不是被断言保证的契约。**
+       哪天有人把 `Field(default_factory=list)` 改成必填（或者把
+       `parse_log_event` 换成 `model_validate(..., strict=True)`），
+       所有旧会话会在**读取时**抛异常 —— 而开发机上新建的会话
+       全都有这个字段，所以本地怎么试都是好的。
+
+    这里刻意**绕过 `append()` 直接往表里写一行原始 payload**：
+    走正常路径的话 `ToolResult` 会自动补上这个字段，
+    那就测不出「读到旧数据会怎样」了。
+    """
+    session = await store.create()
+    legacy_payload = json.dumps(
+        {
+            "kind": "tool",
+            "message": {"role": "tool", "tool_call_id": "c1", "content": "算好了"},
+            "result": {
+                "type": "tool_result",
+                "call_id": "c1",
+                "name": "run_python",
+                "ok": True,
+                "stdout": "5050\n",
+                "stderr": "",
+                "exit_code": 0,
+                "duration_ms": 3,
+                "timed_out": False,
+                "error": None,
+                # ← 注意：**没有** artifacts 这个键。这就是 M4 时期的形状。
+            },
+        },
+        ensure_ascii=False,
+    )
+
+    with sqlite3.connect(store.path) as raw:
+        raw.execute(
+            "INSERT INTO events (session_id, seq, kind, payload, created_at) "
+            "VALUES (?, 0, 'tool', ?, '2026-09-23T00:00:00+00:00')",
+            (session.id, legacy_payload),
+        )
+
+    events = await store.events(session.id)
+
+    assert len(events) == 1
+    event = events[0].event
+    assert isinstance(event, LogTool)
+    assert event.result.artifacts == []
 
 
 async def test_a_decision_can_only_be_answered_once(store: SqliteSessionStore):

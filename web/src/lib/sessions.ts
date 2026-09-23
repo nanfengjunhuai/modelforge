@@ -73,3 +73,33 @@ export async function listSessions(): Promise<Session[]> {
   if (!response.ok) throw await failure(response)
   return (await response.json()) as Session[]
 }
+
+// ══════════════════════════════════════════════════════ 产物
+
+/**
+ * 一个产物的 URL（M5 新增）。
+ *
+ * ⚠️ **这里返回的是后端地址，不是前端路径。** 前端跑在 :3000、后端在 :8000,
+ * 所以 `<img src="...">` 指向的是另一个源。这在图片上是完全正常的 ——
+ * 浏览器不会为了显示图片去要 CORS 头。
+ *
+ * 但**下载是另一回事**：跨源时 `<a download>` 那个属性会被浏览器忽略
+ * （HTML 规范里写死了，只对同源 URL 生效）。所以「点了要下载而不是跳转」
+ * 只能靠服务端的 `Content-Disposition`。这也是 `?download=1` 存在的理由 ——
+ * 一个 URL 干两件事时，内容协商只会让两边都不好用：
+ *
+ *     内联（默认）  给 <img> 用，绝对不能带 attachment，否则图显示不出来
+ *     ?download=1  给下载链接用，带 attachment，浏览器弹保存框
+ *
+ * 想改成同源的话，正确做法是给 `next.config.ts` 配 `rewrites` 把
+ * `/api/*` 代理到后端 —— 但那样 SSE 也要一起走代理，而代理会缓冲响应，
+ * 把流式输出变成攒完再发。这个坑不值得为了一个下载属性去踩。
+ */
+export function artifactUrl(
+  sessionId: string,
+  artifactId: string,
+  options: { download?: boolean } = {},
+): string {
+  const suffix = options.download ? '?download=1' : ''
+  return `${API_BASE}/api/artifacts/${sessionId}/${artifactId}${suffix}`
+}

@@ -117,17 +117,38 @@ import tempfile
 import time
 from pathlib import Path
 
+from modelforge.artifacts.base import ArtifactRef, ArtifactStore, SandboxArtifact, guess_mime
+from modelforge.artifacts.local_store import LocalArtifactStore
 from modelforge.config import Settings, get_settings
+from modelforge.paths import PROJECT_ROOT, is_inside, resolve_project_path
 from modelforge.sandbox.base import ExecutionResult
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["SubprocessExecutor", "find_sandbox_python"]
 
-# 项目根目录。__file__ 是 <root>/modelforge/sandbox/subprocess_exec.py，
-# 往上数三级。用 __file__ 而不是 os.getcwd()，是为了让结果不随「在哪个目录
-# 敲命令」而变。
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# 沙箱运行时目录 —— 每次执行前会被复制进工作目录。
+#
+# 里面现在有两个文件，服务两个不同的目的：
+#   matplotlibrc        科研风格配置（复制进 MPLCONFIGDIR，不是工作目录）
+#   modelforge_plot.py  给模型的绘图辅助模块（复制进工作目录，可 import）
+_RUNTIME_DIR = Path(__file__).resolve().parent / "runtime"
+
+# 产物目录的约定名。模型把文件写进工作目录下的这个子目录，就会被收走。
+#
+# 为什么用「约定目录 + 扫描」而不是「让模型显式声明产出了什么」：
+# 后者要求模型每次都记得声明，而**它一定会忘**，忘了还不会报错，
+# 只是图凭空消失。约定目录下**它是写文件**，而写文件是它本来就在做的事，
+# 忘了的可能性小得多。这和「风格靠环境不靠模型自觉」是同一条原则。
+_ARTIFACT_DIRNAME = "artifacts"
+
+# 单次执行最多收走多少个产物。超出的部分**会被明确告知**（见 `_scan_artifacts`），
+# 不静默丢弃 —— 项目里所有「截断」都遵守这条，见 `_read_capped` 的措辞。
+_MAX_ARTIFACTS = 20
+
+# 单次执行的产物总大小上限。300 dpi 的数模插图大约 100~500 KB，
+# 50 MB 意味着「正常用法碰不到，但一段写疯了的代码撑不爆磁盘」。
+_MAX_TOTAL_BYTES = 50 * 1024 * 1024
 
 
 def find_sandbox_python(settings: Settings) -> Path:
@@ -145,42 +166,30 @@ def find_sandbox_python(settings: Settings) -> Path:
     return PROJECT_ROOT / ".venv-sandbox" / relative
 
 
-def _resolve(path: Path) -> Path:
-    """把相对路径按项目根目录展开。
-
-    为什么不按当前工作目录（CWD）？因为 CWD 是不可靠的 —— 用户可能从任何
-    地方敲启动命令。项目内部的路径一律锚定在项目根目录上。
-    """
-    return path if path.is_absolute() else PROJECT_ROOT / path
-
-
-def _is_inside(child: Path, parent: Path) -> bool:
-    """child 是否在 parent 目录树里（含 parent 自身）。
-
-    比字符串前缀比较可靠：要真正解析成绝对路径再比，
-    否则 `C:/a/bc` 会被误判成在 `C:/a/b` 里面。
-    """
-    try:
-        resolved_child = child.resolve()
-        resolved_parent = parent.resolve()
-    except OSError:  # pragma: no cover —— 路径无法解析时保守地当作不在里面
-        return False
-    return resolved_child == resolved_parent or resolved_parent in resolved_child.parents
-
-
 class SubprocessExecutor:
     """满足 `CodeExecutor` 协议的子进程执行器。"""
 
     name = "subprocess"
 
-    def __init__(self, *, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        settings: Settings | None = None,
+        artifacts: ArtifactStore | None = None,
+    ) -> None:
         self._settings = settings or get_settings()
         self.python = find_sandbox_python(self._settings)
-        self.work_root = _resolve(self._settings.sandbox_work_dir)
+        self.work_root = resolve_project_path(self._settings.sandbox_work_dir)
+        # 产物存哪由注入的存储决定；不传就自己造一个本地实现。
+        #
+        # 这就是 `CodeExecutor` / `ChatProvider` / `TurnRecorder` 那一套：
+        # 沙箱只认 `ArtifactStore` 这个协议，将来换成对象存储或远端服务
+        # 不需要改这里一行。
+        self._artifacts: ArtifactStore = artifacts or LocalArtifactStore(settings=self._settings)
 
         # 工作目录落进项目里是个**看起来无害、实际会间歇性炸**的配置。
         # 与其等着别人踩，不如在构造的时候就喊一声（原因见模块注释「⑤」）。
-        if _is_inside(self.work_root, PROJECT_ROOT):
+        if is_inside(self.work_root, PROJECT_ROOT):
             logger.warning(
                 "沙箱工作目录 %s 位于项目目录内。如果后端用 uvicorn --reload 启动，"
                 "沙箱每次执行生成的 solution.py 都会触发一次热重载，"
@@ -188,6 +197,66 @@ class SubprocessExecutor:
                 "建议改用项目外的目录（默认值就是系统临时目录）。",
                 self.work_root,
             )
+
+        self.mpl_config_dir = self._prepare_mpl_config()
+
+    def _prepare_mpl_config(self) -> Path:
+        """准备 matplotlib 的配置目录：确保存在，并把我们的 matplotlibrc 放进去。
+
+        ⚠️ 这个目录**必须是持久的**，不能是每次执行都删的工作目录。
+
+        M3 把 `MPLCONFIGDIR` 指向了 `<工作目录>/.mplconfig`，而工作目录用完即删，
+        于是**每次执行**都要重建一次字体缓存。
+
+        实测（本机 273 个字体，matplotlib 3.11.2）：
+
+            冷启动（无缓存）  0.870 s
+            热启动（有缓存）  0.453 s
+            ─────────────────────────
+            白交的部分        0.42 s   ← 每次执行
+
+        说清楚它的量级：0.42 秒**不致命**。每次执行是独立进程，这个代价
+        不累积；`sandbox_timeout` 默认 10 秒，它占 4%。所以这不是一个
+        「会炸」的问题，而是一个「每张图都白交 0.42 秒」的问题 ——
+        一场画十几张图的对话要多等好几秒，而且没有任何理由。
+
+        之所以值得在注释里写这么长，是因为它**没有任何症状**：
+        图照出、结果照对，只是慢一点点。这种问题不会有人来报 bug，
+        只会让人觉得「这软件有点钝」。修它只要一行配置。
+
+        （字体缓存本身仍然是有用的 —— 我们只是让它建一次就留下，
+        而不是每次重新建。）
+
+        「每次执行都重新复制一遍 matplotlibrc」是刻意的：这样样式表永远和
+        仓库版本一致。装在 `.venv-sandbox` 里的话，改了样式不重跑安装脚本
+        就还是旧的，而且不会有任何提示。
+        """
+        target = resolve_project_path(self._settings.sandbox_mpl_config_dir)
+        source = _RUNTIME_DIR / "matplotlibrc"
+
+        if is_inside(target, PROJECT_ROOT):
+            logger.warning(
+                "matplotlib 配置目录 %s 位于项目目录内。它的字体缓存文件会被"
+                "不定期重写，同样可能触发 uvicorn --reload 的热重载。"
+                "建议改用项目外的目录（默认值就是系统应用数据目录）。",
+                target,
+            )
+
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            destination = target / "matplotlibrc"
+            # 只在内容真的不一样时才写。目录本身可能是共享的，而这里
+            # 每次请求都会被构造一次 —— 无脑覆盖既是多余的写入，
+            # 也会白白刷新文件的修改时间。
+            if not destination.exists() or destination.read_bytes() != source.read_bytes():
+                shutil.copy(source, destination)
+                logger.debug("已同步 matplotlibrc 到 %s", destination)
+        except OSError as exc:
+            # 不抛异常：配置目录建不出来不该让整个服务起不来。
+            # 后果只是图失去科研风格（退回 matplotlib 默认），
+            # 而不是什么都跑不了 —— 用一个警告换一个降级，比值。
+            logger.warning("准备 matplotlib 配置目录 %s 失败：%s", target, exc)
+        return target
 
     # ────────────────────────────────────────────── 环境变量
 
@@ -231,15 +300,26 @@ class SubprocessExecutor:
         env["TMPDIR"] = str(work_dir)
         env["TEMP"] = str(work_dir)
         env["TMP"] = str(work_dir)
-        # matplotlib 要一个可写的配置目录，否则每次运行都会打印一条
-        # 「Matplotlib is building the font cache」警告，污染 stderr。
-        env["MPLCONFIGDIR"] = str(work_dir / ".mplconfig")
+
+        # matplotlib 的配置目录 —— **持久目录，不是工作目录**。
+        #
+        # ⚠️ 这一行 M5 改过。M3 时它是 `work_dir / ".mplconfig"`，
+        #    而工作目录用完即删，于是每次执行都重建一遍字体缓存（实测 0.42 秒）。
+        #    完整的原因写在 `_prepare_mpl_config` 的 docstring 里。
+        #
+        # 它同时承担第二个职责：里面放着我们的 `matplotlibrc`。
+        # matplotlib 查找配置时 `$MPLCONFIGDIR/matplotlibrc` 排第一位，
+        # 所以**沙箱里任何 matplotlib 代码都会自动套上科研风格**，
+        # 不需要模型配合 —— 这是 M5 图表质量的主要保证。
+        env["MPLCONFIGDIR"] = str(self.mpl_config_dir)
 
         return env
 
     # ────────────────────────────────────────────── 执行
 
-    async def run(self, code: str, *, timeout: float | None = None) -> ExecutionResult:
+    async def run(
+        self, code: str, *, timeout: float | None = None, scope: str | None = None
+    ) -> ExecutionResult:
         """在沙箱里跑一段代码。契约见 `CodeExecutor.run`。"""
         limit = timeout if timeout is not None else self._settings.sandbox_timeout
 
@@ -262,6 +342,17 @@ class SubprocessExecutor:
         # 系统编码解析，中文注释会直接 SyntaxError。
         script.write_text(f"# -*- coding: utf-8 -*-\n{code}\n", encoding="utf-8")
 
+        # 把给模型用的绘图辅助模块放进工作目录。
+        #
+        # 为什么是「每次拷一份」而不是「装进 .venv-sandbox」：
+        # 装了之后它就和仓库版本脱钩了 —— 改了辅助模块，不重跑安装脚本
+        # 就还是旧的，而且**不会有任何提示**。每次拷一个十几 KB 的文件
+        # 可以忽略，换来的是「运行时永远和仓库版本一致」这条不需要维护的不变式。
+        #
+        # `python solution.py` 会把脚本所在目录放进 `sys.path`，
+        # 所以模型直接 `import modelforge_plot` 就能用。
+        _stage_runtime(work_dir)
+
         stdout_path = work_dir / "_stdout.txt"
         stderr_path = work_dir / "_stderr.txt"
 
@@ -275,6 +366,10 @@ class SubprocessExecutor:
             result = await asyncio.to_thread(
                 self._run_blocking, script, work_dir, stdout_path, stderr_path, limit, box
             )
+            # ★ 产物必须在工作目录被删掉之前搬走，所以它在这个 try 里面，
+            #   而不是 `finally` 之后 —— `finally` 会在本行之前执行，
+            #   那时候文件早没了。
+            result.artifacts = await self._collect_artifacts(work_dir, scope, result)
         except asyncio.CancelledError:
             # 用户关掉页面 / 点了停止。Starlette 会取消我们这个协程
             # （见 api/chat.py 的说明），但**线程是取消不掉的** ——
@@ -284,14 +379,61 @@ class SubprocessExecutor:
             if proc is not None:
                 logger.info("请求已取消，终止沙箱进程 pid=%s", proc.pid)
                 _kill_tree(proc)
+            # ⚠️ 取消路径**故意不收集产物**，直接连同工作目录一起丢掉。
+            #
+            # 技术上可以在 CancelledError 里 `await` 一次收集，但那个 await
+            # 会立刻再次抛出 CancelledError（任务已经被取消了），得用
+            # `asyncio.shield` 包起来才行 —— M4 在释放租约那里踩过同一个坑。
+            #
+            # 值不值得多这一层？不值得。用户主动点了停止，意味着他不想等这一轮；
+            # 而已经跑完的那几轮产物早就各自收走了，这里丢的最多是**当前这一轮**
+            # 的画到一半的图。这和 ADR-009 已经接受的「用户中途刷新时，
+            # 被中断的那一轮已流出的文字会消失」是同一件事，口径一致。
             raise
         finally:
-            # 至少把大文件清掉。整个目录留给系统临时目录清理也可以，
-            # 但主动删更干净 —— M5 要做「产物面板」时会改成按需保留。
+            # 产物已经被搬走了（或者这次执行本来就没有产物），
+            # 剩下的都是中间文件：solution.py、stdout/stderr 的原始文件、
+            # 模型自己写坏的那些。整个删掉。
+            #
+            # M3 时的注释写着「M5 要做产物面板时会改成按需保留」——
+            # 实际做法比那个设想更简单：不是「按需保留工作目录」，
+            # 而是「把要留的东西搬出去，然后照常删」。
+            # 这样清理逻辑完全没变，多出来的只有一次搬运。
             _safe_rmtree(work_dir)
 
         result.duration_ms = int((time.monotonic() - started) * 1000)
         return result
+
+    # ────────────────────────────────────────────── 产物
+
+    async def _collect_artifacts(
+        self, work_dir: Path, scope: str | None, result: ExecutionResult
+    ) -> list[ArtifactRef]:
+        """把工作目录 `artifacts/` 下的文件搬进产物存储。
+
+        `scope` 是 None 时直接返回空 —— 那表示调用方（无状态端点）没有地方
+        保存产物。**这是刻意的**：与其给它们找一个临时归宿然后再想怎么清理，
+        不如让行为与 M3 完全一致（跑完即删），少一条需要理解的分支。
+
+        这个函数**永远不抛异常**。产物搬运失败不该让整次执行变成失败 ——
+        代码跑成功了、stdout 拿到了，这才是主要结果；图丢了是次要的损失。
+        """
+        if scope is None:
+            return []
+
+        try:
+            found, notes = await asyncio.to_thread(_scan_artifacts, work_dir)
+            # 截断/丢弃的说明写进 stderr，会经由 `format_for_model` 原样
+            # 呈现给模型。这和同文件里「输出过长已截断」「执行超过 N 秒」
+            # 那两条提示是同一个做法：**有取舍就要说出来，不能静默截断。**
+            for note in notes:
+                result.stderr += f"\n…（{note}）"
+            if not found:
+                return []
+            return await self._artifacts.ingest(scope, found)
+        except Exception:
+            logger.warning("收集产物时发生未预期的异常", exc_info=True)
+            return []
 
     def _run_blocking(
         self,
@@ -385,6 +527,121 @@ class SubprocessExecutor:
         text = raw.decode("utf-8", errors="replace")
         truncated = len(text) > cap or size > len(raw)
         return text[:cap], truncated
+
+def _stage_runtime(work_dir: Path) -> None:
+    """把沙箱运行时里**可 import 的**文件复制进工作目录。
+
+    目前只有一个 `modelforge_plot.py`。`matplotlibrc` 在同一个目录里，
+    但它**不往工作目录拷** —— 它走 `MPLCONFIGDIR`（见 `_build_env`）。
+    两边都放就成了两个真相源，而 matplotlib 查配置的顺序里 CWD 排在
+    `$MPLCONFIGDIR` 之后，出问题时你会去改一个没生效的文件。
+    """
+    for name in ("modelforge_plot.py",):
+        try:
+            shutil.copy(_RUNTIME_DIR / name, work_dir / name)
+        except OSError as exc:
+            # 拷不进去的后果是模型 `import modelforge_plot` 报 ImportError，
+            # 那条报错会原样回到模型手上，它能自己改成不用这个模块的写法。
+            # 所以这里只记一笔，不让整次执行失败。
+            logger.warning("把 %s 放进沙箱工作目录失败：%s", name, exc)
+
+
+def _scan_artifacts(work_dir: Path) -> tuple[list[SandboxArtifact], list[str]]:
+    """找出工作目录 `artifacts/` 下模型产出的文件。
+
+    返回 `(找到的文件, 给人看的取舍说明)`。第二条是**必须**的 ——
+    这个函数会截断，而项目里所有截断都要说出来（对比 `_read_capped`
+    的措辞）。静默丢弃会让用户看到「方案里说有三张图，界面上只有两张」
+    而完全不知道为什么。
+
+    这里的顺序是**文件名排序**，所以「留下哪 20 个」是可复现的，
+    不取决于文件系统返回目录项的顺序。不是因为字母序更合理，
+    而是因为**确定的坏行为比随机的好行为好排查**。
+    """
+    root = work_dir / _ARTIFACT_DIRNAME
+    if not root.is_dir():
+        # 绝大多数执行都不会产出文件（只是算个数）。这条路径要快。
+        return [], []
+
+    found: list[SandboxArtifact] = []
+    total_bytes = 0
+    over_count = 0
+    over_size = 0
+
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+
+        relative = path.relative_to(root)
+        # 跳过 Python 自己造的东西和隐藏文件：`__pycache__`、编辑器备份、
+        # matplotlib 可能临时落下的 `.#xxx`。它们不是用户要的产物。
+        if any(part.startswith(".") or part == "__pycache__" for part in relative.parts):
+            continue
+
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size == 0:
+            # 空文件几乎总是「代码跑到一半崩了」留下的，不是有意的产物。
+            continue
+
+        if len(found) >= _MAX_ARTIFACTS:
+            over_count += 1
+            continue
+        if total_bytes + size > _MAX_TOTAL_BYTES:
+            over_size += 1
+            continue
+
+        total_bytes += size
+        found.append(
+            SandboxArtifact(
+                # 用相对路径而不是纯文件名：万一模型建了子目录
+                # （`artifacts/图/权重.png`），把路径显示出来比
+                # 让两张同名文件在界面上长得一模一样要好。
+                # 统一成正斜杠，免得同样的东西在 Windows 和 Linux 上
+                # 显示成两种样子。
+                #
+                # 顺手把控制字符去掉。POSIX 上文件名可以含 `\n`/`\r`，
+                # 而这个名字最终会出现在 HTTP 响应头（下载时的
+                # `Content-Disposition`）里 —— 头注入是真实存在的一类漏洞。
+                # 这里清掉，是在这个名字**第一次变成结构化数据**的地方清，
+                # 而不是指望后面每个消费者自己记得。
+                name=_sanitize_name(str(relative).replace("\\", "/")),
+                path=path,
+                size=size,
+                mime=guess_mime(relative.name),
+            )
+        )
+
+    notes: list[str] = []
+    if over_count:
+        notes.append(f"产物超过 {_MAX_ARTIFACTS} 个，有 {over_count} 个没有被保存")
+    if over_size:
+        limit_mb = _MAX_TOTAL_BYTES // (1024 * 1024)
+        notes.append(f"产物总大小超过 {limit_mb} MB，有 {over_size} 个没有被保存")
+
+    return found, notes
+
+
+def _sanitize_name(name: str) -> str:
+    """去掉文件名里的控制字符。
+
+    这不是路径安全措施（防穿越的是 uuid 落盘，见 `artifacts/base.py`），
+    而是**协议安全措施**：这个名字会进 HTTP 响应头。POSIX 的文件名可以含
+    `\\r\\n`，而把未清洗的字符串拼进响应头就是经典的 header injection。
+
+    ⚠️ **先 strip 再替换，顺序不能反。** 反过来的话，行尾的 `\\r\\n` 会先被
+    换成 `?`，而 `?` 是可打印字符，`strip()` 就再也去不掉它了 ——
+    一个本该干干净净的名字会带着两个问号尾巴。
+
+    剩下的位置只保留可打印字符，其余换成 `?`。用 `?` 而不是删掉，是为了让
+    「这里原来有个怪字符」这件事在界面上看得见，而不是让两个不同的文件名
+    变成同一个。
+    """
+    cleaned = "".join(ch if ch.isprintable() else "?" for ch in name.strip())
+    return cleaned or "未命名产物"
+
 
 def _kill_tree(proc: subprocess.Popen[bytes]) -> None:
     """杀掉进程**及它的所有后代**。

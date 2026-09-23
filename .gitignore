@@ -33,9 +33,24 @@ next-env.d.ts
 *.db
 *.db-journal
 *.sqlite
-data/
-artifacts/
-sandbox_tmp/
+
+# ⚠️ 下面三条**必须带前导斜杠**（锚定在仓库根）。
+#
+# 不带斜杠的 `artifacts/` 会匹配**任何层级**下叫这个名字的目录 ——
+# 包括 `modelforge/artifacts/`，而那是 M5 新加的正式代码包。
+# 症状极其阴险：`git status` 一声不吭，本地测试全绿，
+# **只有 clone 下来才会发现少了一整个包**。
+#
+# 判断一个 ignore 规则有没有踩这个坑：`git check-ignore -v <路径>`。
+/data/
+/artifacts/
+/sandbox_tmp/
+
+# scripts/smoke_artifact.py 把下载回来的图放在这里等着人肉眼看。
+# 它**刻意放在项目里**（和真正的产物目录相反）—— 因为它的用途就是
+# 「打开这个目录看一眼」，扔进系统目录会很难找。它会触发 uvicorn 的
+# --reload，但跑那个脚本时本来就要人盯着看，重载一次无所谓。
+.smoke/
 
 # ---- 编辑器 / 系统 ----
 .vscode/*

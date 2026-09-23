@@ -276,7 +276,7 @@ async def test_every_stream_event_type_can_actually_be_produced():
     class _Executor:
         name = "fake"
 
-        async def run(self, code: str, *, timeout: float | None = None):
+        async def run(self, code: str, *, timeout: float | None = None, scope: str | None = None):
             from modelforge.sandbox.base import ExecutionResult
 
             return ExecutionResult(stdout="ok\n", exit_code=0)
@@ -332,4 +332,68 @@ async def test_every_stream_event_type_can_actually_be_produced():
     assert seen == _python_event_types(StreamEvent), (
         f"\n定义了但没有任何人产出：{sorted(_python_event_types(StreamEvent) - seen)}"
         f"\n产出了但没定义：{sorted(seen - _python_event_types(StreamEvent))}"
+    )
+
+
+# ══════════════════════════════════════════════════════ 产物的字段名
+
+
+def test_tool_result_artifacts_field_exists_on_both_sides(ts_source: str, ts_log_source: str):
+    """`ToolResult.artifacts` 必须两边都有。
+
+    M5 给 `ToolResult` 加了这个字段，而它要穿过**四个**文件：
+
+        providers/events.py       ToolResult            ← 真相源
+        sessions/base.py          LogTool.result        （直接复用上面那个模型，自动跟着走）
+        web/src/lib/stream-types.ts   ToolResultEvent
+        web/src/lib/log-types.ts      LoggedToolResult
+
+    后两个是手写的镜像，而**跨语言字段名写错不会有任何东西变红** ——
+    把 `artifacts` 写成 `artifact` 的话，前端只是永远拿到 undefined，
+    然后安静地不显示任何图。后端测试全绿，前端编译也全绿。
+
+    这正是 M4 那个日志事件字段名契约测试要防的同一类问题，
+    所以沿用同样的办法：把两边的源码当纯文本读进来比对。
+    """
+    from modelforge.providers.events import ToolResult
+
+    assert "artifacts" in ToolResult.model_fields, "后端的 ToolResult 上没有 artifacts 字段"
+
+    # 前端那两个镜像**类型名不同**（一个带 Event 后缀、一个没有），
+    # 所以要分别按类型名定位，不能用「找 tool_result 这个字符串」——
+    # 那个字符串会先落在类型体内的 `type: 'tool_result'` 上，
+    # 于是往后找的 `export type` 变成**下一个**类型块，
+    # 测试会指着一个完全无关的类型说它少了字段。（写这个的时候真踩了一次。）
+    for source, label, type_name in (
+        (ts_source, "stream-types.ts", "ToolResultEvent"),
+        (ts_log_source, "log-types.ts", "LoggedToolResult"),
+    ):
+        block = re.search(rf"export type {type_name} = \{{(.*?)\n\}}", source, re.S)
+        assert block, f"{label} 里找不到 {type_name} 的定义"
+        assert re.search(r"^\s*artifacts\??:", block.group(1), re.M), (
+            f"{label} 的 {type_name} 里没有 artifacts 字段"
+        )
+
+
+def test_artifact_ref_fields_are_identical_on_both_sides(ts_source: str):
+    """`ArtifactRef` 的字段名也要一致。
+
+    这个模型会在下载链接、缩略图、文件大小提示里被用到 ——
+    少一个字段的表现是「界面上少显示一点东西」，没人会当成 bug 来报。
+
+    比的是**字段名集合**而不是顺序：TypeScript 那边的字段顺序和 Python
+    不一样，而那不影响任何行为。
+    """
+    from modelforge.artifacts.base import ArtifactRef
+
+    python_fields = set(ArtifactRef.model_fields)
+
+    match = re.search(r"export type ArtifactRef = \{(.*?)\n\}", ts_source, re.S)
+    assert match, "stream-types.ts 里找不到 ArtifactRef"
+
+    ts_fields = set(re.findall(r"^\s*(\w+)\??:", match.group(1), re.M))
+
+    assert python_fields == ts_fields, (
+        f"\n只在 Python 里有：{sorted(python_fields - ts_fields)}"
+        f"\n只在 TypeScript 里有：{sorted(ts_fields - python_fields)}"
     )

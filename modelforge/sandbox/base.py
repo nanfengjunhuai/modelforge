@@ -47,7 +47,9 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from modelforge.artifacts.base import ArtifactRef
 
 __all__ = ["CodeExecutor", "ExecutionResult"]
 
@@ -74,6 +76,17 @@ class ExecutionResult(BaseModel):
     # 与「代码跑了但报错」是完全不同的两件事，绝不能混。
     error: str | None = None
 
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
+    """这次执行产出的文件（图、CSV……），M5 新增。
+
+    注意存的是 **`ArtifactRef` 而不是路径** —— 文件在 `run()` 返回之前
+    就已经被搬进产物存储了，那时候工作目录已经被删掉。所以调用方拿到的
+    是一个可以长期保存、可以直接发给前端的引用，而不是一个马上失效的路径。
+
+    这里也解释了为什么「产物」这个概念必须在**执行器**这一层解决：
+    只有执行器知道工作目录什么时候被删，也只有它能在删除之前把东西搬走。
+    """
+
     @property
     def launched(self) -> bool:
         """代码到底有没有被真正执行过。"""
@@ -90,7 +103,9 @@ class CodeExecutor(Protocol):
     name: str
     """执行器标识名，如 "subprocess"。用于日志和界面提示。"""
 
-    async def run(self, code: str, *, timeout: float | None = None) -> ExecutionResult:
+    async def run(
+        self, code: str, *, timeout: float | None = None, scope: str | None = None
+    ) -> ExecutionResult:
         """在一个受限环境里跑一段 Python 代码，把结果收集回来。
 
         实现者必须保证的契约：
@@ -108,8 +123,24 @@ class CodeExecutor(Protocol):
           3. **必须能安全地并发调用。** 每次执行都要用**互不相同的**工作目录，
              否则两次执行会互相踩对方的文件。
 
+          4. **产物必须在工作目录被删掉之前搬走**（M5 新增）。实现要么自己
+             完成搬运，要么保证 `ExecutionResult.artifacts` 里的东西在返回时
+             已经落到一个不会随工作目录消失的地方 —— 反正不能是
+             「路径给你了，但那个目录已经被我删了」。
+
         Args:
             code: 要执行的 Python 源码。
             timeout: 覆盖默认超时（秒）。None 表示用配置里的值。
+            scope: 这次执行产出的文件**归属谁**（会话 id）。
+
+                ⚠️ 它是一个**不透明标签**：执行器只把它当「分桶用的名字」，
+                不知道、也不该知道会话是什么。这样沙箱层不必依赖会话层 ——
+                和无状态端点共用同一个实现时，`scope=None` 表示
+                「这次执行不保留任何产物」，行为与 M3 完全一致。
+
+                这个参数是 M5 加的，代价是 Docker / 远程执行器等
+                将来要实现的执行器也得多接一个它用不上的参数。接受这个代价，
+                因为替代方案（让执行器持有一个知道会话的协作者）会把
+                会话概念漏进沙箱层 —— 那正是 `TurnRecorder` 当初要避免的事。
         """
         ...

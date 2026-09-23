@@ -278,6 +278,7 @@ async def run_agent_turn(
     temperature: float = 0.2,
     max_tokens: int | None = None,
     max_rounds: int | None = None,
+    scope: str | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """跑完一个 Agent 回合，产出**一条连续的、契约完整的**事件流。
 
@@ -296,6 +297,18 @@ async def run_agent_turn(
         temperature: 采样温度。
         max_tokens: 单轮输出上限。
         max_rounds: 工具调用轮数上限。None 表示用配置里的默认值。
+        scope: 工具产出的文件归属谁（会话 id），M5 新增。
+
+            这个参数只是**路过**这里 —— 循环自己不碰产物，它把 scope 原样
+            转交给 `dispatch`，最后进到 `executor.run()`。之所以要在这里
+            开一个口子，是因为循环是唯一同时知道「要执行什么」和「这次执行
+            属于哪次对话」的地方：
+
+                api/sessions.py   知道会话，但不知道工具调用的细节
+                sandbox/tools.py  知道怎么执行，但不知道会话
+                agents/loop.py    ← 两者在这里交汇，所以在这里对接
+
+            无状态端点不传，产物就不保留 —— 那里没有地方放，也没有界面展示。
 
     Yields:
         `StreamEvent`：文本增量、工具调用碎片、**工具执行结果**、
@@ -363,7 +376,7 @@ async def run_agent_turn(
         for call in state.calls:
             if call.name == ASK_USER_NAME:
                 continue
-            result = await dispatch(call, executor=executor)
+            result = await dispatch(call, executor=executor, scope=scope)
             message = _tool_message(call, result)
             tool_messages[call.id] = message
             # 落盘在 yield 之前：让数据库始终**领先于**网络。

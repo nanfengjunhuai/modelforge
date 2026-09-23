@@ -434,15 +434,20 @@ export default function ChatPage() {
             </div>
           )}
 
-          {state.messages.map((m) => (
-            <MessageBubble
-              key={m.key}
-              msg={m}
-              streaming={streaming}
-              submittingCallId={submittingCallId}
-              onDecide={(callId, choice, note) => void decide(callId, choice, note)}
-            />
-          ))}
+          {/* `sessionId &&` 这个守卫是必要的，不只是为了类型：消息气泡里的
+              产物要从 `/api/artifacts/{会话}/…` 取，没有会话 id 就拼不出 URL。
+              启动过程中（还没建好会话）本来也没有消息可显示。 */}
+          {sessionId &&
+            state.messages.map((m) => (
+              <MessageBubble
+                key={m.key}
+                msg={m}
+                streaming={streaming}
+                submittingCallId={submittingCallId}
+                onDecide={(callId, choice, note) => void decide(callId, choice, note)}
+                sessionId={sessionId}
+              />
+            ))}
 
           {/* 首字还没到时的占位提示。
               模型从收到请求到吐出第一个字有几百毫秒延迟（实测 571ms），

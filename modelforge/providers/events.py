@@ -38,6 +38,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
+from modelforge.artifacts.base import ArtifactRef
+
 __all__ = [
     "DecisionRequest",
     "ErrorEvent",
@@ -192,6 +194,29 @@ class ToolResult(BaseModel):
     timed_out: bool = False
     # 我们这边的失败（参数不是合法 JSON、沙箱解释器不存在……），不是代码的失败
     error: str | None = None
+
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
+    """这次执行产出的文件（图、CSV……），M5 新增。
+
+    ════════════════════════════════════════════════════════════════
+    为什么加在这里，而不是新增一种日志事件
+    ════════════════════════════════════════════════════════════════
+    产物是**一次工具调用的结果**，就这么多。给它单开一种 `LogArtifact`
+    事件的话，会立刻引出一个问题：它和那条 `tool` 事件怎么配对？
+    答案是「靠 call_id 配」，于是同一件事就有了两个真相源，而它们可以不一致
+    （日志里有 tool 没该 artifact、或者反过来）。
+
+    挂在 `ToolResult` 上则完全不引入这种可能 —— 产物跟着结果走，
+    一次调用要么有结果要么没有，不存在「产物的记录丢了但结果的记录还在」。
+
+    实际收益很具体：**刷新页面时产物自动就回来了**。因为 M4 定下
+    「`tool` 事件原样存整个 `ToolResult`」，产物引用就跟着一起进了日志，
+    连一次新的查询都不用写。
+
+    ⚠️ 它是**冻结**的。产物元数据一旦写进日志就不能再改（ADR-009：
+    日志只能 append）。所以想做「删掉某个产物」，做法是删文件 + 在日志里
+    追加一条「已删除」的记录，而不是回去把这条改了。M5 不做这个功能。
+    """
 
 
 class DecisionRequest(BaseModel):

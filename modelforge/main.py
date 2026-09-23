@@ -21,8 +21,18 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from modelforge import __version__
-from modelforge.api import chat, health, sessions
+from modelforge import artifacts as artifact_store_pkg
+from modelforge.api import artifacts, chat, health, sessions
 from modelforge.config import get_settings
+
+# ⚠️ 注意别把这两个搞混：`sessions.get_store()` 给的是**会话**存储
+# （事件日志），`artifact_store_pkg.get_store()` 给的是**产物**存储（文件）。
+# 两个包里都叫 `get_store`，返回的类型却完全不同 —— 所以这里一律给包起别名，
+# 让每个调用点自己说清楚要的是哪一个。
+#
+# 为什么是「包.函数」而不是 `from ... import get_store`：后者在导入时就把
+# 函数对象绑死了，tests/conftest.py 的 monkeypatch 换不掉它 ——
+# 而换不掉的后果是**测试会去写你真实的用户目录，却依然全绿**。
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +48,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     开发时用 `--reload` 会频繁重启，不关的话未释放的连接会越积越多，
     最后在日志里看到一堆 "Unclosed client session" 之类的告警。
 
-    启动时还多做一件事：**清空所有会话租约**。见下面那段注释。
+    启动时还多做两件事，都是同一类问题 —— **异常退出会留下垃圾**：
+
+        · 清空所有会话租约（M4）
+        · 清理没有归属的产物目录（M5）
+
+    两者都只清理**能证明已经没人要**的东西，见各自的注释。
     """
     logger.info("ModelForge %s 启动中……", __version__)
 
@@ -61,6 +76,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # 数据库还没建（第一次启动）、或者文件权限有问题……
         # 这不该阻止服务起来：租约本来就有 TTL 兜底。
         logger.warning("清空会话租约失败（不影响启动）", exc_info=True)
+
+    # ── 清理孤儿产物（M5）─────────────────────────────────────
+    #
+    # 产物的落盘和那条 `tool` 事件的写入不是原子的：文件先搬进产物目录，
+    # 随后进程被强杀，事件就没记进日志 —— 于是盘上多了一个谁都不认识的
+    # 目录，而且再也没人会来认领它（界面上看不到，删会话也删不到）。
+    #
+    # ⚠️ 这个操作跑在**用户的数据目录**里，所以只删**能证明是孤儿**的目录：
+    #    名字不在现存会话集合里的那些。这里宁可漏删也不能错删 ——
+    #    漏删的代价是一点磁盘空间，错删的代价是用户的图没了。
+    #
+    # `limit` 给得很大是有意的：这里要的是**全部**会话 id，不是「最近 50 个」。
+    # 用默认值的话，一个第 51 老的会话，它的产物会在每次启动时被当成孤儿删掉 ——
+    # 而且是静默地删。
+    try:
+        known = {s.id for s in await sessions.get_store().list_recent(limit=10_000)}
+        removed = await artifact_store_pkg.get_store().sweep_orphans(known)
+        if removed:
+            logger.info("已清理 %d 个没有归属的产物目录", removed)
+    except Exception:
+        logger.warning("清理孤儿产物失败（不影响启动）", exc_info=True)
 
     yield
 
@@ -117,6 +153,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router, prefix="/api")
     app.include_router(chat.router, prefix="/api")
     app.include_router(sessions.router, prefix="/api")
+    app.include_router(artifacts.router, prefix="/api")
 
     logger.info(
         "ModelForge %s 已装配，默认模型 provider: %s", __version__, settings.default_provider

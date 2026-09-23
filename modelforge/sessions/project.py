@@ -48,6 +48,7 @@ from collections.abc import Sequence
 from pydantic import BaseModel
 
 from modelforge.agents.prompts import SYSTEM_PROMPT
+from modelforge.artifacts.base import ArtifactRef
 from modelforge.providers.base import Message
 from modelforge.sessions.base import (
     LogAssistant,
@@ -66,6 +67,8 @@ __all__ = [
     "build_messages",
     "derive_status",
     "derive_title",
+    "find_artifact",
+    "list_artifacts",
     "list_decisions",
     "pending_decision",
     "project_messages",
@@ -311,3 +314,45 @@ def derive_status(items: Sequence[StoredEvent | LogEvent]) -> SessionStatus:
     由租约（`Session.busy`）表达，刻意不混进来。原因见 `base.SessionStatus`。
     """
     return "awaiting_user" if pending_decision(items) is not None else "idle"
+
+
+# ══════════════════════════════════════════════════════ 产物
+
+
+def list_artifacts(items: Sequence[StoredEvent | LogEvent]) -> list[ArtifactRef]:
+    """按时间顺序列出这个会话产出的全部产物。
+
+    和 `list_decisions` 是同一类东西：**从事件日志里读回来的、给界面用的视图**。
+    界面上刷新一下图还在，靠的就是它 —— 因为产物引用是被存进 `tool` 事件的
+    `result.artifacts` 里的（见 `ToolResult.artifacts` 的说明）。
+
+    注意这里**不碰磁盘**。它回答的是「日志说产出过什么」，而不是
+    「盘上现在有什么」。两者可能有出入（文件被手动删了），那是文件系统的问题，
+    不该由投影层去掩盖 —— 掩盖的结果是日志不再忠实。
+    """
+    found: list[ArtifactRef] = []
+    for item in items:
+        event = _unwrap(item)
+        if isinstance(event, LogTool):
+            found.extend(event.result.artifacts)
+    return found
+
+
+def find_artifact(items: Sequence[StoredEvent | LogEvent], artifact_id: str) -> ArtifactRef | None:
+    """按 id 找一个产物。找不到返回 None。
+
+    存在的理由是**下载时的文件名**。产物在磁盘上叫 `3f2a…c1.png`（uuid，
+    见 `artifacts/local_store.py`），而用户想拿到的是一个有意义的文件名 ——
+    那个名字（「三种赋权方法的权重对比.png」）只在日志里。
+
+    所以下载端点必须回日志里查一次。这也是「日志是唯一真相源」的一个
+    顺带好处：**不需要为「人看的名字」单独存一份**，它本来就在那儿。
+
+    线性扫描是可以接受的：一个会话的产物最多几十个，而事件总数也就几百条。
+    真要优化的话，正确的做法不是加索引，而是把 `list_artifacts` 的结果缓存到
+    会话详情响应里 —— 那是前端的活，不是这里的。
+    """
+    for artifact in list_artifacts(items):
+        if artifact.id == artifact_id:
+            return artifact
+    return None

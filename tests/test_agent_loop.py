@@ -77,9 +77,16 @@ class _FakeExecutor:
     def __init__(self, result: ExecutionResult | None = None) -> None:
         self._result = result or ExecutionResult(stdout="5050\n", exit_code=0, duration_ms=3)
         self.seen_code: list[str] = []
+        # 记下每次执行收到的 scope（M5）。循环有没有把会话 id 透传下来，
+        # 只能从这里看出来 —— 一个不传 scope 的实现跑起来和正确的**一模一样**，
+        # 区别只在于产物最后没有归宿。
+        self.seen_scopes: list[str | None] = []
 
-    async def run(self, code: str, *, timeout: float | None = None) -> ExecutionResult:
+    async def run(
+        self, code: str, *, timeout: float | None = None, scope: str | None = None
+    ) -> ExecutionResult:
         self.seen_code.append(code)
+        self.seen_scopes.append(scope)
         return self._result
 
 

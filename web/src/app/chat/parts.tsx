@@ -23,6 +23,8 @@ import {
   type Msg,
   type ToolCallView,
 } from '@/lib/chat-state'
+import type { ArtifactRef } from '@/lib/stream-types'
+import { artifactUrl } from '@/lib/sessions'
 
 // ══════════════════════════════════════════════════════ 消息气泡
 
@@ -38,12 +40,15 @@ export function MessageBubble({
   streaming,
   submittingCallId,
   onDecide,
+  sessionId,
 }: {
   msg: Msg
   streaming: boolean
   /** 正在提交中的决策 call_id —— 用来禁用按钮，防止连点。 */
   submittingCallId: string | null
   onDecide: (callId: string, choice: string, note: string) => void
+  /** 产物要从 `/api/artifacts/{会话}/{产物}` 取，所以得透到工具卡片那一层。 */
+  sessionId: string
 }) {
   const isUser = msg.role === 'user'
   // 「正在进行」= 这条是正在被写入的那条助手消息，且已经有内容了。
@@ -84,6 +89,7 @@ export function MessageBubble({
               tool={tool}
               submitting={submittingCallId === tool.decision?.callId}
               onDecide={onDecide}
+              sessionId={sessionId}
             />
           ))}
         </div>
@@ -102,15 +108,17 @@ function ToolView({
   tool,
   submitting,
   onDecide,
+  sessionId,
 }: {
   tool: ToolCallView
   submitting: boolean
   onDecide: (callId: string, choice: string, note: string) => void
+  sessionId: string
 }) {
   if (tool.decision || tool.name === 'ask_user') {
     return <DecisionCard tool={tool} submitting={submitting} onDecide={onDecide} />
   }
-  return <ToolCallCard tool={tool} />
+  return <ToolCallCard tool={tool} sessionId={sessionId} />
 }
 
 // ══════════════════════════════════════════════════════ 决策卡片
@@ -265,7 +273,7 @@ function DecisionCard({
  * M3 最重要的界面元素 —— 它把「Agent 在后台干了什么」摊开给用户看。
  * 没有它，用户只能看到模型说「我算出来是 5050」，无从判断这个数是怎么来的。
  */
-function ToolCallCard({ tool }: { tool: ToolCallView }) {
+function ToolCallCard({ tool, sessionId }: { tool: ToolCallView; sessionId: string }) {
   // 折叠状态交给 React 管（受控），而不是让 <details> 自己管（非受控）。
   // 非受控的话会有一个很隐蔽的坑：组件每次重渲染，React 都会把 open 属性
   // 按 vdom 里的值重新写一遍，把用户手动折叠的状态冲掉。
@@ -312,6 +320,13 @@ function ToolCallCard({ tool }: { tool: ToolCallView }) {
           </span>
         )}
       </div>
+
+      {/* ── 产物：**放在折叠区外面** ──
+          图是这张卡片上最值得看的东西，藏进「代码与输出」里就等于没有。
+          层次是：状态 → 产物 → 细节（代码和 stdout 按需展开）。 */}
+      {result && result.artifacts.length > 0 && (
+        <ArtifactGallery sessionId={sessionId} artifacts={result.artifacts} />
+      )}
 
       {/* ── 主体：代码 + 输出，可折叠 ── */}
       <details
@@ -365,4 +380,223 @@ function ToolCallCard({ tool }: { tool: ToolCallView }) {
       </details>
     </div>
   )
+}
+
+// ══════════════════════════════════════════════════════ 产物
+
+/**
+ * 一张工具卡片产出的文件（M5）。
+ *
+ * ════════════════════════════════════════════════════════════════════
+ * 为什么产物长在**工具卡片里面**，而不是单独开一个面板
+ * ════════════════════════════════════════════════════════════════════
+ * 「这段代码生成了这张图」本身就是一个完整的、自洽的信息单元。
+ * 把它抽到一个全局的产物面板里，用户就得在两处之间来回对：
+ * 这个文件是哪一步跑出来的？改了代码之后它还作数吗？
+ *
+ * 将来工作台铺开时会再加一个「本会话全部产物」的侧栏 —— 那是**另一个视图**，
+ * 不是把这一处的信息搬走。两者的关系是「局部上下文」和「全局清单」。
+ */
+function ArtifactGallery({
+  sessionId,
+  artifacts,
+}: {
+  sessionId: string
+  artifacts: ArtifactRef[]
+}) {
+  // 图排在前面：它是这一轮里最值得看的东西，让它出现在需要滚动才能到的地方
+  // 是说不过去的。
+  const images = artifacts.filter((a) => a.kind === 'image')
+  const files = artifacts.filter((a) => a.kind !== 'image')
+
+  return (
+    <div className="border-t border-hairline bg-plane">
+      {images.length > 0 && (
+        <div className="flex flex-wrap gap-3 p-3">
+          {images.map((artifact) => (
+            <ArtifactImage key={artifact.id} sessionId={sessionId} artifact={artifact} />
+          ))}
+        </div>
+      )}
+      {files.length > 0 && (
+        <div
+          className={`flex flex-col gap-2 p-3 ${
+            images.length > 0 ? 'border-t border-hairline' : ''
+          }`}
+        >
+          {files.map((artifact) => (
+            <ArtifactFile key={artifact.id} sessionId={sessionId} artifact={artifact} />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ArtifactImage({
+  sessionId,
+  artifact,
+}: {
+  sessionId: string
+  artifact: ArtifactRef
+}) {
+  const inline = artifactUrl(sessionId, artifact.id)
+
+  return (
+    <figure className="overflow-hidden rounded-control border border-hairline bg-surface">
+      <a href={inline} target="_blank" rel="noreferrer" title="在新标签页打开原图">
+        {/* ⚠️ 这里用原生 <img> 而不是 next/image，是有理由的，不是偷懒：
+            这些图是**本机后端**产出的 300 dpi 位图，已经是最优形态了。
+            next/image 会把它拉去优化器重新编码一遍，而且需要提前知道
+            宽高（我们不知道 —— 图是模型的代码画出来的，尺寸任意）。
+            优化器那一步纯属绕远路，还会让「后端没起来」这种问题
+            表现为一个图片优化错误，而不是一个直白的 404。 */}
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={inline}
+          alt={artifact.name}
+          loading="lazy"
+          decoding="async"
+          // 只限高、不限宽：图的长宽比是模型定的，硬套一个比例会把它拉变形。
+          className="max-h-80 w-auto"
+        />
+      </a>
+      <figcaption className="flex items-center gap-2 border-t border-hairline px-3 py-2 text-caption">
+        <span className="truncate text-ink-secondary" title={artifact.name}>
+          {artifact.name}
+        </span>
+        <span className="ml-auto shrink-0 font-mono text-ink-muted">
+          {formatBytes(artifact.size)}
+        </span>
+        <a
+          href={artifactUrl(sessionId, artifact.id, { download: true })}
+          className="shrink-0 text-brand-600 hover:underline"
+        >
+          下载
+        </a>
+      </figcaption>
+    </figure>
+  )
+}
+
+const KIND_LABEL: Record<ArtifactRef['kind'], string> = {
+  data: '数据',
+  document: '文档',
+  other: '文件',
+  image: '图片', // 图片走缩略图那条路，这个标签用不上，但类型要求齐全
+}
+
+function ArtifactFile({
+  sessionId,
+  artifact,
+}: {
+  sessionId: string
+  artifact: ArtifactRef
+}) {
+  // 约定：`<名字>.chart.json` 是 `mp.save(chart=...)` 存下来的**图背后的数据**。
+  // 它下一轮会被用来渲染可交互的版本，这一轮先原样展示 ——
+  // 「图表建立在数据之上」这件事得先看得见，才谈得上后面拿它画图。
+  const isChartData = artifact.name.endsWith('.chart.json')
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-2 text-caption">
+        <span className="shrink-0 rounded-control bg-raised px-1.5 py-0.5 text-ink-muted">
+          {KIND_LABEL[artifact.kind]}
+        </span>
+        <span className="truncate text-ink-secondary" title={artifact.name}>
+          {artifact.name}
+        </span>
+        <span className="ml-auto shrink-0 font-mono text-ink-muted">
+          {formatBytes(artifact.size)}
+        </span>
+        <a
+          href={artifactUrl(sessionId, artifact.id, { download: true })}
+          className="shrink-0 text-brand-600 hover:underline"
+        >
+          下载
+        </a>
+      </div>
+      {isChartData && <ChartDataView sessionId={sessionId} artifact={artifact} />}
+    </div>
+  )
+}
+
+/**
+ * 把 `.chart.json` 里的数据摊开给用户看。
+ *
+ * ════════════════════════════════════════════════════════════════════
+ * 为什么是「打开时才去取」，而不是一进页面就全拉回来
+ * ════════════════════════════════════════════════════════════════════
+ * 一次对话可能画十几张图，每张都带一份数据。全拉的话，用户只是打开一个
+ * 旧会话，浏览器就要发十几个请求、把几百 KB 的 JSON 读进内存 ——
+ * 而其中大部分他根本不会看。
+ *
+ * 这里只在他真的展开时才去取一次，取过就留着（`state !== 'idle'` 那个判断）。
+ * 和 `loading="lazy"` 是同一个思路：**默认不付看不见的代价。**
+ *
+ * 触发点是 `onToggle` 而不是 `useEffect`：这是**用户动作**引起的，
+ * 不是「状态变了要同步」。写在 effect 里会被 React Compiler 的
+ * `set-state-in-effect` 规则拦下来，而那条规则拦得对 —— effect 里的
+ * setState 会多渲染一轮，还容易写出循环。
+ */
+function ChartDataView({
+  sessionId,
+  artifact,
+}: {
+  sessionId: string
+  artifact: ArtifactRef
+}) {
+  const [phase, setPhase] = useState<'idle' | 'loading' | 'ready' | 'failed'>('idle')
+  const [spec, setSpec] = useState<unknown>(null)
+
+  async function load() {
+    if (phase !== 'idle') return // 只取一次
+    setPhase('loading')
+    try {
+      const response = await fetch(artifactUrl(sessionId, artifact.id))
+      if (!response.ok) throw new Error(String(response.status))
+      setSpec(await response.json())
+      setPhase('ready')
+    } catch {
+      setPhase('failed')
+    }
+  }
+
+  return (
+    <details
+      onToggle={(event) => {
+        if (event.currentTarget.open) void load()
+      }}
+    >
+      <summary className="cursor-pointer select-none text-caption text-ink-muted transition-colors hover:text-ink-secondary">
+        图背后的数据
+      </summary>
+      {phase === 'loading' && (
+        <p className="pt-1 text-caption text-ink-muted">正在读取……</p>
+      )}
+      {phase === 'failed' && (
+        <p className="pt-1 text-caption text-serious-ink">
+          读不到这份数据（文件可能已经不在了）。
+        </p>
+      )}
+      {phase === 'ready' && (
+        <pre className="mt-1 max-h-64 overflow-auto rounded-control border border-hairline bg-surface px-3 py-2 text-caption leading-relaxed text-ink-secondary">
+          {JSON.stringify(spec, null, 2)}
+        </pre>
+      )}
+    </details>
+  )
+}
+
+/**
+ * 字节数 → 人看得懂的写法。
+ *
+ * 用 KB / MB（1000 进制）而不是 KiB / MiB：这里显示的是给用户估个大小的，
+ * 「这个文件大概多大」比「精确到 1024 的二进制单位」重要得多。
+ */
+function formatBytes(size: number): string {
+  if (size < 1000) return `${size} B`
+  if (size < 1000 * 1000) return `${Math.round(size / 1000)} KB`
+  return `${(size / (1000 * 1000)).toFixed(1)} MB`
 }
