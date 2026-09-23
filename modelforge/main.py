@@ -13,16 +13,35 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from modelforge import __version__
-from modelforge.api import health
+from modelforge.api import chat, health
 from modelforge.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """应用的生命周期钩子：yield 之前是启动，之后是关闭。
+
+    为什么需要它？因为 Provider 内部持有一个 httpx 连接池，而连接池必须在
+    进程退出时显式关闭。FastAPI 里没有别的地方适合放这段清理逻辑 ——
+    写 `atexit` 不行（它跑在同步上下文里，没法 await 异步的关闭）。
+
+    开发时用 `--reload` 会频繁重启，不关的话未释放的连接会越积越多，
+    最后在日志里看到一堆 "Unclosed client session" 之类的告警。
+    """
+    logger.info("ModelForge %s 启动中……", __version__)
+    yield
+    await chat.close_providers()
+    logger.info("ModelForge 已关闭，连接池已释放")
 
 
 def _configure_logging(debug: bool) -> None:
@@ -58,6 +77,7 @@ def create_app() -> FastAPI:
         version=__version__,
         docs_url="/api/docs",
         openapi_url="/api/openapi.json",
+        lifespan=lifespan,
     )
 
     app.add_middleware(
@@ -71,6 +91,7 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(health.router, prefix="/api")
+    app.include_router(chat.router, prefix="/api")
 
     logger.info(
         "ModelForge %s 已装配，默认模型 provider: %s", __version__, settings.default_provider
